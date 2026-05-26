@@ -29,12 +29,27 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Node.js
-sdk/nodejs/node_modules/
+# Node.js (root-hoisted by workspaces)
+node_modules/
+.npm/
+
+# Node.js SDK
 sdk/nodejs/dist/
 sdk/nodejs/coverage/
 sdk/nodejs/*.tsbuildinfo
-sdk/nodejs/.npm/
+
+# Web UI (Next.js)
+webui/.next/
+webui/out/
+webui/next-env.d.ts
+webui/.turbo/
+webui/.vercel/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
 # Editor
 .idea/

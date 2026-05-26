@@ -1,0 +1,14 @@
+{
+  "name": "spectrum-monorepo",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "sdk/nodejs",
+    "webui"
+  ],
+  "scripts": {
+    "build:sdk": "npm run build -w @h1/sdk",
+    "dev:webui": "npm run dev -w h1-webui",
+    "build:webui": "npm run build -w h1-webui"
+  }
+}
