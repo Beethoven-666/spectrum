@@ -1,0 +1,30 @@
+# Project defaults for the H1 spectrometer demo on ESP32-S3.
+#
+# Generated sdkconfig will inherit these; tweak via `idf.py menuconfig`.
+
+# --- Target ---------------------------------------------------------------
+CONFIG_IDF_TARGET="esp32s3"
+
+# --- Console over native USB Serial/JTAG ----------------------------------
+# The user is connected via /dev/cu.usbmodemXXXX (native USB CDC), not the
+# UART bridge port, so route printf/log there.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# --- C++ runtime ----------------------------------------------------------
+# SDK uses exceptions for ProtocolError/TimeoutError/DeviceError.
+CONFIG_COMPILER_CXX_EXCEPTIONS=y
+CONFIG_COMPILER_CXX_EXCEPTIONS_EMG_POOL_SIZE=0
+
+# --- Stacks ---------------------------------------------------------------
+# Streaming uses std::thread (pthread on FreeRTOS). 4 KB default is tight
+# once you hand a SpectrumFrame (with optional TM30 = 2.5 KB) to a callback.
+CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=16384
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+
+# --- Tick rate ------------------------------------------------------------
+# 1 kHz tick → millisecond-resolution timeouts (the SDK passes ms values).
+CONFIG_FREERTOS_HZ=1000
+
+# --- Log level ------------------------------------------------------------
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
