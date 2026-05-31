@@ -1,0 +1,18 @@
+[Unit]
+Description=Spectrum Web UI
+After=network-online.target spectrum-acq.service
+Wants=network-online.target spectrum-acq.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/spectrum
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=ACQUISITION_API_BASE_URL=http://127.0.0.1:8000
+ExecStart=%h/.local/bin/npm run start -w h1-webui -- --hostname 0.0.0.0 --port 3005
+Restart=on-failure
+RestartSec=3
+StandardOutput=append:%h/spectrum/logs/webui.log
+StandardError=append:%h/spectrum/logs/webui.log
+
+[Install]
+WantedBy=default.target

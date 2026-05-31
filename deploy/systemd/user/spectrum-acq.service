@@ -1,0 +1,17 @@
+[Unit]
+Description=Spectrum acquisition API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/spectrum
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/spectrum/acquisition/.venv/bin/spectrum-acq --data-dir ./data --hardware --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=3
+StandardOutput=append:%h/spectrum/logs/acquisition.log
+StandardError=append:%h/spectrum/logs/acquisition.log
+
+[Install]
+WantedBy=default.target

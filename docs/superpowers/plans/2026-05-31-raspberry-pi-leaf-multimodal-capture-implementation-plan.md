@@ -1,9 +1,27 @@
 # Raspberry Pi 叶片多模态采集设备实施计划
 
 **日期**: 2026-05-31
-**状态**: Ready for implementation
+**状态**: v1 implemented and hardware-smoked
 **对应设计**: `docs/superpowers/specs/2026-05-31-raspberry-pi-leaf-multimodal-capture-design.md`
 **说明**: 本机未安装 `writing-plans` skill；此文档按已批准 spec 手工生成，作为实施入口。
+
+## 0. 当前实施结果
+
+- Python acquisition service 已实现 mock 和真实硬件模式。
+- H1 光谱仪真实 smoke 通过，序列号 `H11B6V10534FFPD-211-0021`，波长范围 `340-1050`，单帧 `711` 点。
+- D455F 真实 color/depth smoke 通过，序列号 `419122302660`，默认 profile 为 `640x480@15`。
+- D455 IMU 在当前 Ubuntu 24.04 上受 Linux IIO 权限限制；服务会降级采集 color/depth/pointcloud，并把 IMU 错误写入 `d455/imu.json`。
+- WebUI `/acquisition` 页面和 Next.js `/api/acquisition/*` 代理已实现；页面包含采集、样本、设置、标定四个操作区。
+- D455 预览包含 RGB 和 depth 两路，depth 预览端点在 Pi 上返回 `200`。
+- WebUI 通过 SSE `/events` 显示采集状态和失败原因。
+- 样本列表通过 `/samples/{sample_id}/preview` 显示 ROI 缩略图。
+- 通过 WebUI 代理完成了真实 D455 + H1 采集，样本 `20260530T225403896Z_4a132d` 已落盘并进入 SQLite 索引。
+- H1 状态和样本 metadata 记录 `exposure_mode` 与 `max_exposure_time_us`。
+- 主 RGB 线缆未到，当前实现使用 `NullMainRgbProvider` 写入 `main_rgb/status.json` 的 `missing` 状态。
+- `spectrum-acq rebuild-index --data-dir ./data` 已在 Pi 上验证，可从样本目录重建 SQLite。
+- `POST /samples/export` 支持 `quality_status` / `calibration_version` / `limit` 筛选；Pi 上已生成 `samples_warn_20260530T225914Z.zip`。
+- 本机和 Pi 上 acquisition 测试均为 `10 passed`；本机和 Pi 上 `npm run build:webui` 均通过。
+- 标定 `pi-e2e-v3` 在服务重启后保持，并写入新样本 metadata 与 SQLite `calibration_version`。
 
 ## 1. 实施原则
 

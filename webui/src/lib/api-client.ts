@@ -24,14 +24,14 @@ export class ApiCallError extends Error {
 }
 
 async function parseError(res: Response): Promise<ApiCallError> {
-  let body: { error?: string; code?: number; cmdType?: number } = {};
+  let body: { error?: string; detail?: string; code?: number; cmdType?: number } = {};
   try {
     body = await res.json();
   } catch {
     body = { error: res.statusText || `HTTP ${res.status}` };
   }
   return new ApiCallError({
-    error: body.error ?? `HTTP ${res.status}`,
+    error: body.error ?? body.detail ?? `HTTP ${res.status}`,
     code: body.code,
     cmdType: body.cmdType,
     status: res.status,
