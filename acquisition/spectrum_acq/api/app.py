@@ -53,6 +53,31 @@ def create_app(config: AcquisitionConfig | None = None) -> FastAPI:
     def devices() -> dict[str, Any]:
         return to_jsonable(coordinator.devices())
 
+    @app.get("/h1/stream")
+    def h1_stream(
+        tm30: bool = Query(default=False),
+        max_frames: int | None = Query(default=None, ge=1, le=1000),
+    ) -> StreamingResponse:
+        def stream():
+            yield ": ok\n\n"
+            try:
+                for frame in coordinator.stream_h1(include_tm30=tm30, max_frames=max_frames):
+                    payload = json.dumps(to_jsonable(frame), ensure_ascii=False)
+                    yield f"event: frame\ndata: {payload}\n\n"
+            except Exception as exc:  # noqa: BLE001 - SSE clients need an event payload
+                payload = json.dumps({"error": str(exc)}, ensure_ascii=False)
+                yield f"event: error\ndata: {payload}\n\n"
+
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     @app.get("/storage")
     def storage() -> dict[str, Any]:
         return to_jsonable(coordinator.store.storage_status())

@@ -12,10 +12,26 @@ import { SpectrumChart } from '@/components/spectrum-chart';
 import { ExposureStatusBadge } from '@/components/status-badge';
 import { numFixed, numInt } from '@/lib/format';
 import { useSpectrumStream } from '@/lib/sse';
-import { useConnectionStore } from '@/store/connection';
+import {
+  acquisitionPath,
+  type AcquisitionDevices,
+  type AcquisitionHealth,
+} from '@/lib/acquisition-client';
+import { fetcher } from '@/lib/api-client';
+import useSWR from 'swr';
 
 export default function StreamPage(): React.ReactElement {
-  const connected = useConnectionStore((s) => s.status.connected);
+  const { data: health } = useSWR<AcquisitionHealth>(
+    acquisitionPath('/health'),
+    fetcher,
+    { refreshInterval: 5_000 },
+  );
+  const { data: devices } = useSWR<AcquisitionDevices>(
+    acquisitionPath('/devices'),
+    fetcher,
+    { refreshInterval: 5_000 },
+  );
+  const connected = health?.ok === true && devices?.h1?.status === 'ready';
   const [running, setRunning] = useState(false);
   const [tm30, setTm30] = useState(false);
   const { frame, stats } = useSpectrumStream({ enabled: running && connected, tm30 });
@@ -23,9 +39,9 @@ export default function StreamPage(): React.ReactElement {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-2xl font-semibold tracking-tight">实时光谱流</h1>
+        <h1 className="text-2xl font-semibold tracking-tight">H1 实时光谱流</h1>
         <p className="text-sm text-muted-foreground">
-          通过 SSE 接收 0x33 / 0x35 流式帧。停止流时会自动调用 0x04。
+          通过树莓派 acquisition 服务接收真实 H1 0x33 / 0x35 流式帧，启动前会先执行自动曝光。
         </p>
       </div>
 
@@ -33,7 +49,7 @@ export default function StreamPage(): React.ReactElement {
         <CardHeader className="flex flex-row items-start justify-between gap-4 space-y-0">
           <div>
             <CardTitle className="text-base">流控制</CardTitle>
-            <CardDescription>仅允许一个客户端同时串流。</CardDescription>
+            <CardDescription>采集服务串行访问 H1 串口，样本采集与实时流不会并发打开设备。</CardDescription>
           </div>
           <div className="flex items-center gap-4">
             <label className="flex items-center gap-2 text-sm">
@@ -97,9 +113,9 @@ export default function StreamPage(): React.ReactElement {
             <div className="flex h-64 items-center justify-center text-sm text-muted-foreground">
               {connected
                 ? running
-                  ? '等待第一帧…'
-                  : '点击开始按钮启动 SSE 串流。'
-                : '请先连接设备。'}
+                  ? '正在执行自动曝光并等待第一帧…'
+                  : '点击开始按钮启动树莓派 H1 串流。'
+                : '等待树莓派 H1 就绪。'}
             </div>
           )}
         </CardContent>

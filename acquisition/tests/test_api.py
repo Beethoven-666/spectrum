@@ -62,6 +62,19 @@ def test_api_mock_capture_roundtrip(tmp_path: Path) -> None:
     assert missing.status_code == 404
 
 
+def test_h1_stream_sse_uses_acquisition_device(tmp_path: Path) -> None:
+    app = create_app(default_config(tmp_path / "data"))
+    client = TestClient(app)
+
+    with client.stream("GET", "/h1/stream?max_frames=2") as response:
+        assert response.status_code == 200
+        body = "".join(response.iter_text())
+
+    assert "event: frame" in body
+    assert '"wavelengthStart": 340' in body
+    assert '"rawSpectrum":' in body
+
+
 def test_config_and_calibration_affect_next_sample(tmp_path: Path) -> None:
     app = create_app(default_config(tmp_path / "data"))
     client = TestClient(app)

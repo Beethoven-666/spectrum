@@ -1,12 +1,13 @@
 /**
- * useSpectrumStream — open `/api/device/stream` over EventSource and surface
- * the latest frame plus FPS / drop counters.
+ * useSpectrumStream — open the acquisition H1 stream over EventSource and
+ * surface the latest frame plus FPS / drop counters.
  */
 
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
 
+import { acquisitionPath } from './acquisition-client';
 import type { SerializedSpectrumFrame } from './serialize';
 
 export interface StreamStats {
@@ -40,7 +41,7 @@ export function useSpectrumStream({ enabled, tm30 }: UseSpectrumStreamOptions): 
     if (!enabled) {
       return;
     }
-    const url = `/api/device/stream${tm30 ? '?tm30=1' : ''}`;
+    const url = `${acquisitionPath('/h1/stream')}${tm30 ? '?tm30=1' : ''}`;
     const es = new EventSource(url);
     let stopped = false;
 
@@ -93,8 +94,6 @@ export function useSpectrumStream({ enabled, tm30 }: UseSpectrumStreamOptions): 
     return () => {
       stopped = true;
       es.close();
-      // Best-effort tell server to stop. Don't await; component is unmounting.
-      void fetch('/api/device/stream/stop', { method: 'POST' });
       setStats((s) => ({ ...s, open: false }));
     };
   }, [enabled, tm30]);

@@ -21,8 +21,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: 'H1 调试台 · 光谱仪开发工具',
-  description: '基于 @h1/sdk 的 H1 光谱仪 Web 调试界面',
+  title: 'Spectrum 采集台 · 树莓派硬件采集',
+  description: '树莓派 H1 光谱仪与 D455 多模态采集界面',
 };
 
 export default function RootLayout({

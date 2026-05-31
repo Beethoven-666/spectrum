@@ -32,12 +32,12 @@ const ITEMS: ReadonlyArray<{
   icon: React.ComponentType<{ className?: string }>;
   group: string;
 }> = [
-  { href: '/', label: '仪表盘', icon: Activity, group: '调试' },
-  { href: '/stream', label: '实时流', icon: ChartLine, group: '调试' },
-  { href: '/capture', label: '单帧采集', icon: Aperture, group: '调试' },
   { href: '/acquisition', label: '多模态采集', icon: DatabaseZap, group: '采集' },
-  { href: '/settings', label: '设备设置', icon: Settings, group: '配置' },
-  { href: '/curve', label: '效率曲线', icon: TrendingUp, group: '配置' },
+  { href: '/stream', label: 'H1 实时流', icon: ChartLine, group: '采集' },
+  { href: '/debug', label: '本机仪表盘', icon: Activity, group: '本机 H1 调试' },
+  { href: '/capture', label: '本机单帧采集', icon: Aperture, group: '本机 H1 调试' },
+  { href: '/settings', label: '本机设备设置', icon: Settings, group: '本机 H1 调试' },
+  { href: '/curve', label: '本机效率曲线', icon: TrendingUp, group: '本机 H1 调试' },
   { href: '/logs', label: '协议日志', icon: FileTerminal, group: '观察' },
 ];
 
@@ -50,8 +50,8 @@ export function AppSidebar(): React.ReactElement {
         <div className="flex items-center gap-2 px-2 py-1.5">
           <Wand2 className="h-5 w-5 text-primary" />
           <div className="flex flex-col leading-tight">
-            <span className="text-sm font-semibold">H1 调试台</span>
-            <span className="text-xs text-muted-foreground">光谱仪开发工具</span>
+            <span className="text-sm font-semibold">Spectrum 采集台</span>
+            <span className="text-xs text-muted-foreground">树莓派硬件采集</span>
           </div>
         </div>
       </SidebarHeader>

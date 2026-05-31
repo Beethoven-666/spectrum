@@ -75,11 +75,11 @@ class DiskThresholds:
 @dataclass(frozen=True)
 class H1AutoExposureConfig:
     mode: ExposureModeName = "conservative"
-    max_attempts: int = 3
+    max_attempts: int = 8
     under_multiplier: float = 1.7
     over_multiplier: float = 0.55
     min_exposure_us: int = 500
-    max_exposure_us: int = 1_000_000
+    max_exposure_us: int = 5_000_000
     initial_exposure_us: int = 50_000
 
 

@@ -1,19 +1,22 @@
-# H1 调试台 (`h1-webui`)
+# Spectrum 采集台 (`h1-webui`)
 
-基于 Next.js 15 (App Router) + shadcn/ui 的 H1 光谱仪开发调试 Web UI。
-复用本仓库的 [`@h1/sdk`](../sdk/nodejs/) 进行所有协议通信。
+基于 Next.js 16 (App Router) + shadcn/ui 的树莓派 H1 + D455 多模态采集 Web UI。
+默认入口连接 Python acquisition service，展示树莓派上的真实硬件状态。
+本机 H1 调试页仍复用本仓库的 [`@h1/sdk`](../sdk/nodejs/) 进行协议通信。
 
 ## 模式
 
-- **Mock 模式（默认）**：内置 `MockSerialPort` + 合成数据生成器，无需任何硬件即可使用。
-- **真实串口**：通过环境变量 `H1_PORT=/dev/cu.usbserial-XXXX` 切换，或在 UI 顶部"连接"侧栏中选择"串口"页签。
+- **树莓派真实采集（默认）**：`/acquisition` 通过 `ACQUISITION_API_BASE_URL` 访问 acquisition service，读取真实 H1/D455 状态。
+- **本机 H1 串口调试**：进入 `/debug`、`/stream`、`/capture` 等本机调试页后，通过环境变量 `H1_PORT=/dev/cu.usbserial-XXXX` 自动连接，或在顶部"连接"侧栏中选择"串口"页签。
+- **Mock 模式（显式）**：只有设置 `H1_MOCK=1` 或在顶部连接侧栏中手动选择 Mock 时，才使用内置 `MockSerialPort`。
 
 ## 环境变量
 
 | 变量 | 含义 | 默认 |
 | --- | --- | --- |
-| `H1_MOCK` | 设为 `1` 时强制 Mock | 未设置时也默认 mock |
-| `H1_PORT` | 真实串口路径 | 仅当无 `H1_MOCK` 且需要硬件时设置 |
+| `ACQUISITION_API_BASE_URL` | acquisition service 地址 | `http://127.0.0.1:8000` |
+| `H1_MOCK` | 设为 `1` 时强制本机调试页 Mock | 未设置时不 mock |
+| `H1_PORT` | 本机调试页真实串口路径 | 未设置时保持未连接 |
 
 ## 开发
 
@@ -24,10 +27,10 @@
 npm install
 npm run build:sdk
 
-# 2) 启动 dev server（默认 mock 模式）
+# 2) 启动 dev server（默认访问 acquisition service）
 npm run dev:webui
-# 或
-H1_MOCK=1 npm run dev -w h1-webui
+# 本机 SDK mock 调试需要显式开启：
+# H1_MOCK=1 npm run dev -w h1-webui
 
 # 3) 构建
 npm run build:webui
@@ -39,11 +42,13 @@ npm run build:webui
 
 | 页面 | 说明 |
 | --- | --- |
-| `/` | 仪表盘：连接信息、单帧快速采集 |
-| `/stream` | SSE 实时光谱流，FPS / 累计帧统计 |
-| `/capture` | 单帧详情（含 47 + 1 + 3 + 16 + 614 全部参数）+ JSON/CSV 下载 |
-| `/settings` | 曝光 / CIE / 工作模式 / 睡眠 |
-| `/curve` | 效率曲线上传、校验、恢复出厂 |
+| `/` | 重定向到 `/acquisition` |
+| `/acquisition` | 树莓派 H1 + D455 多模态采集 |
+| `/debug` | 本机 H1 调试仪表盘 |
+| `/stream` | 树莓派 H1 SSE 实时光谱流，FPS / 累计帧统计 |
+| `/capture` | 本机 H1 单帧详情（含 47 + 1 + 3 + 16 + 614 全部参数）+ JSON/CSV 下载 |
+| `/settings` | 本机 H1 曝光 / CIE / 工作模式 / 睡眠 |
+| `/curve` | 本机 H1 效率曲线上传、校验、恢复出厂 |
 | `/logs` | 协议字节级日志（Mock 模式自动拦截） |
 
 ## API（部分）

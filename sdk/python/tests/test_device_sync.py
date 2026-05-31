@@ -66,6 +66,35 @@ def test_get_device_info_roundtrip():
     assert port.writes[0] == hx("CC 01 0A 00 00 08 18 F7 0D 0A")
 
 
+def test_request_resynchronises_after_leading_garbage():
+    port = MockSerialPort()
+    port.on_command(
+        Cmd.GET_DEVICE_INFO,
+        lambda _: b"\x00\x00\xCC\x00"
+        + build_response_frame(Cmd.GET_DEVICE_INFO, b"H11B6V10534CFPD-100-0002"),
+    )
+    with Device(port) as dev:
+        info = dev.get_device_info()
+    assert info.serial_number == "H11B6V10534CFPD-100-0002"
+
+
+def test_request_skips_stale_nonmatching_frame():
+    port = MockSerialPort()
+    stale_stream_frame = build_response_frame(
+        Cmd.START_STREAM_NO_TM30, synth_spectrum_valid()
+    )
+    target_response = build_response_frame(
+        Cmd.GET_EXPOSURE_TIME, struct.pack("<I", 321_000)
+    )
+    port.on_command(
+        Cmd.GET_EXPOSURE_TIME,
+        lambda _: stale_stream_frame + target_response,
+    )
+    with Device(port) as dev:
+        exposure_time_us = dev.get_exposure_time_us()
+    assert exposure_time_us == 321_000
+
+
 def test_get_wavelength_range_roundtrip():
     port = MockSerialPort()
     port.on_command(

@@ -35,7 +35,7 @@ import { ThemeToggle } from './theme-toggle';
 
 export function ConnectionBar(): React.ReactElement {
   const pathname = usePathname();
-  if (pathname.startsWith('/acquisition')) {
+  if (pathname.startsWith('/acquisition') || pathname.startsWith('/stream')) {
     return <AcquisitionConnectionBar />;
   }
   return <H1ConnectionBar />;

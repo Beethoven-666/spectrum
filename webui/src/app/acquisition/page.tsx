@@ -737,10 +737,10 @@ function draftToConfig(draft: ConfigDraft): Partial<AcquisitionConfig> {
     },
     h1_auto_exposure: {
       mode: draft.h1Mode,
-      max_attempts: intValue(draft.maxAttempts, 3),
+      max_attempts: intValue(draft.maxAttempts, 8),
       initial_exposure_us: intValue(draft.initialExposureUs, 50000),
       min_exposure_us: intValue(draft.minExposureUs, 500),
-      max_exposure_us: intValue(draft.maxExposureUs, 1000000),
+      max_exposure_us: intValue(draft.maxExposureUs, 5000000),
       under_multiplier: numberValue(draft.underMultiplier, 1.7),
       over_multiplier: numberValue(draft.overMultiplier, 0.55),
     },

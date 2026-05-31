@@ -8,8 +8,9 @@
  * Connection model:
  *  - The webui starts disconnected.
  *  - First `connect({mode:'mock'})` (or `connect({mode:'serial', port})`) opens.
- *  - `H1_MOCK=1` env (set by `npm run dev` etc.) toggles eager mock connect on
- *    first access, so the dashboard works without clicking Connect.
+ *  - `H1_PORT=/dev/...` enables eager serial connect on first access.
+ *  - `H1_MOCK=1` explicitly enables eager mock connect; mock is never the
+ *    fallback for missing hardware config.
  */
 
 import { Device } from '@h1/sdk';
@@ -134,15 +135,16 @@ export async function disconnect(): Promise<ConnectionStatus> {
   return getStatus();
 }
 
-/**
- * Lazy auto-connect for first request when `H1_MOCK=1` is set. Idempotent.
- */
+/** Lazy auto-connect for explicit env configuration. Idempotent. */
 export async function ensureAutoConnect(): Promise<void> {
   const s = getState();
   if (s.device) return;
-  if (process.env.H1_MOCK === '1' || !process.env.H1_PORT) {
+  if (process.env.H1_MOCK === '1') {
     await connect({ mode: 'mock' });
     return;
   }
-  await connect({ mode: 'serial', port: process.env.H1_PORT });
+  const h1Port = process.env.H1_PORT?.trim();
+  if (h1Port) {
+    await connect({ mode: 'serial', port: h1Port });
+  }
 }

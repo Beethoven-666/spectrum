@@ -5,6 +5,7 @@ from __future__ import annotations
 import random
 import threading
 import time
+from collections.abc import Iterator
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -47,17 +48,51 @@ class CaptureCoordinator:
         self._lock = threading.Lock()
         self._state = CaptureState.IDLE
         self._current: dict[str, Any] = {"state": self._state, "sample_id": None, "error": None}
+        self._last_h1_status: dict[str, Any] | None = None
 
     @property
     def state(self) -> dict[str, Any]:
         return to_jsonable(self._current)
 
     def devices(self) -> dict[str, Any]:
+        if self._lock.acquire(blocking=False):
+            try:
+                h1_status = to_jsonable(self.h1.status())
+                self._last_h1_status = h1_status
+            finally:
+                self._lock.release()
+        else:
+            h1_status = self._last_h1_status or {
+                "status": str(DeviceStatus.ERROR),
+                "serial_number": None,
+                "wavelength_range": None,
+                "exposure_time_us": None,
+                "exposure_mode": None,
+                "max_exposure_time_us": None,
+                "detail": {"error": "H1 capture or stream is busy"},
+            }
         return {
-            "h1": to_jsonable(self.h1.status()),
+            "h1": h1_status,
             "d455": to_jsonable(self.d455.status()),
             "main_rgb": to_jsonable(self.main_rgb.status()),
         }
+
+    def stream_h1(
+        self,
+        *,
+        include_tm30: bool = False,
+        max_frames: int | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        if not self._lock.acquire(timeout=5.0):
+            raise RuntimeError("capture busy")
+        try:
+            yield from self.h1.stream(
+                include_tm30=include_tm30,
+                max_frames=max_frames,
+                config=self.config.h1_auto_exposure,
+            )
+        finally:
+            self._lock.release()
 
     def capture(
         self,
@@ -66,7 +101,7 @@ class CaptureCoordinator:
         exposure_mode: str | None = None,
         force: bool = False,
     ) -> CaptureResult:
-        if not self._lock.acquire(blocking=False):
+        if not self._lock.acquire(timeout=5.0):
             raise RuntimeError("capture busy")
         sample_id = make_sample_id()
         started_wall = utc_now_iso()

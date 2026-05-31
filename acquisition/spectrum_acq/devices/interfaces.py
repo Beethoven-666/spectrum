@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from collections.abc import Iterator
 from typing import Any, Protocol
 
 import numpy as np
@@ -70,6 +71,14 @@ class H1Spectrometer(Protocol):
     def status(self) -> H1Status: ...
 
     def capture_auto(self, config: H1AutoExposureConfig) -> H1Capture: ...
+
+    def stream(
+        self,
+        *,
+        include_tm30: bool = False,
+        max_frames: int | None = None,
+        config: H1AutoExposureConfig | None = None,
+    ) -> Iterator[dict[str, Any]]: ...
 
 
 class RealSenseCamera(Protocol):

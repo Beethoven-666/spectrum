@@ -84,6 +84,7 @@ class Device:
         self._default_timeout = timeout
         self._lock = threading.RLock()
         self._streaming = False
+        self._reset_input_buffer()
 
     # ---- lifecycle --------------------------------------------------------
 
@@ -101,6 +102,15 @@ class Device:
                 pass
 
     # ---- low-level wire helpers ------------------------------------------
+
+    def _reset_input_buffer(self) -> None:
+        reset = getattr(self._port, "reset_input_buffer", None)
+        if not callable(reset):
+            return
+        try:
+            reset()
+        except Exception:  # noqa: BLE001 - best-effort serial hygiene
+            pass
 
     def _write_frame(self, frame: bytes) -> None:
         self._port.write(frame)
@@ -128,18 +138,42 @@ class Device:
             out.extend(chunk)
         return bytes(out)
 
+    def _read_response_header(self, timeout: float) -> bytes:
+        """Read until the response header appears, discarding stale bytes."""
+        deadline = time.monotonic() + timeout
+        matched = bytearray()
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise H1TimeoutError(
+                    f"timed out after {timeout:.3f}s waiting for response header "
+                    f"{_p.HEADER_RESP.hex()}"
+                )
+            byte = self._read_exact(1, remaining)
+            value = byte[0]
+            if not matched:
+                if value == _p.HEADER_RESP[0]:
+                    matched.append(value)
+                continue
+            if value == _p.HEADER_RESP[1]:
+                return bytes(matched) + byte
+            if value == _p.HEADER_RESP[0]:
+                matched[:] = byte
+            else:
+                matched.clear()
+
     def _read_frame(self, expected_cmd_type: int, timeout: float) -> bytes:
         """Read one full response frame for ``expected_cmd_type``."""
-        # Read header (2) + totalLen (3) so we know how many more bytes to read.
-        head = self._read_exact(5, timeout)
-        if head[0:2] != _p.HEADER_RESP:
-            raise ProtocolError(
-                f"bad response header: {head[0:2].hex()}; expected {_p.HEADER_RESP.hex()}"
-            )
+        deadline = time.monotonic() + timeout
+        # Sync to header (2) then read totalLen (3) so we know frame length.
+        header = self._read_response_header(timeout)
+        remaining = max(deadline - time.monotonic(), 0.0)
+        head = header + self._read_exact(3, remaining)
         total_len = int.from_bytes(head[2:5], "little")
         if total_len < _p.FRAME_OVERHEAD or total_len > 1_000_000:
             raise ProtocolError(f"implausible totalLen={total_len}")
-        rest = self._read_exact(total_len - 5, timeout)
+        remaining = max(deadline - time.monotonic(), 0.0)
+        rest = self._read_exact(total_len - 5, remaining)
         return head + rest
 
     def _request(
@@ -152,10 +186,18 @@ class Device:
         to = timeout if timeout is not None else self._default_timeout
         with self._lock:
             self._write_frame(frame)
-            raw = self._read_frame(expected_cmd_type, to)
-            data_type, valid = _p.parse_frame(raw, expected_cmd_type=expected_cmd_type)
-            assert data_type == expected_cmd_type  # parse_frame guarantees
-            return valid
+            deadline = time.monotonic() + to
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise H1TimeoutError(
+                        f"timed out after {to:.3f}s waiting for response "
+                        f"0x{expected_cmd_type:02X}"
+                    )
+                raw = self._read_frame(expected_cmd_type, remaining)
+                data_type, valid = _p.parse_frame(raw)
+                if data_type == expected_cmd_type:
+                    return valid
 
     # ---- device meta ------------------------------------------------------
 

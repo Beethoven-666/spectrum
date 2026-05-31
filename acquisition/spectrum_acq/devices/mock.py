@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import asdict
+from typing import Any, Iterator
 
 import numpy as np
 
@@ -93,6 +94,21 @@ class MockH1Spectrometer:
             spectrum_coefficient=coeff,
         )
 
+    def stream(
+        self,
+        *,
+        include_tm30: bool = False,
+        max_frames: int | None = None,
+        config: H1AutoExposureConfig | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        emitted = 0
+        exposure_config = config or H1AutoExposureConfig()
+        while max_frames is None or emitted < max_frames:
+            capture = self.capture_auto(exposure_config)
+            yield h1_capture_to_stream_frame(capture, include_tm30=include_tm30)
+            emitted += 1
+            time.sleep(0.1)
+
     def _status_sequence(self, max_attempts: int) -> list[str]:
         if self.scenario == "under_then_normal":
             return ["under", "normal"][:max_attempts]
@@ -114,6 +130,32 @@ class MockH1Spectrometer:
             baseline = 500 + (wl - 340) * 1.2
             out.append(max(0, min(65535, int((baseline + chlorophyll_peak + green_peak) * scale))))
         return out
+
+
+def h1_capture_to_stream_frame(capture: H1Capture, *, include_tm30: bool) -> dict[str, Any]:
+    wavelength_start = capture.wavelengths[0] if capture.wavelengths else 0
+    return {
+        "exposureStatus": exposure_status_code(capture.selected_attempt.exposure_status),
+        "exposureTimeUs": capture.selected_attempt.exposure_time_us,
+        "photometric": capture.photometric,
+        "blueHazard": {"Eb": 0.0},
+        "nir": {"redEe": 0.0, "nirEeA": 0.0, "nirEeB": 0.0},
+        "plant": capture.plant,
+        "tm30": None if not include_tm30 else {},
+        "spectrumCoefficient": capture.spectrum_coefficient,
+        "wavelengthStart": wavelength_start,
+        "rawSpectrum": capture.raw_spectrum,
+        "actualSpectrum": capture.actual_spectrum,
+        "wavelengths": capture.wavelengths,
+    }
+
+
+def exposure_status_code(status: str) -> int:
+    if status == "over":
+        return 1
+    if status == "under":
+        return 2
+    return 0
 
 
 class MockD455Camera:
