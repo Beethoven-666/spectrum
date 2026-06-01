@@ -1,22 +1,10 @@
-import { ensureAutoConnect, requireDevice } from '@/lib/device-manager';
-import { errorResponse } from '@/lib/api-errors';
+import type { NextRequest } from 'next/server';
+
+import { proxyToAcquisition } from '@/lib/acquisition-proxy';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-export async function GET(): Promise<Response> {
-  try {
-    await ensureAutoConnect();
-    const device = requireDevice();
-    const [info, range] = await Promise.all([
-      device.getDeviceInfo(),
-      device.getWavelengthRange(),
-    ]);
-    return Response.json({
-      serialNumber: info.serialNumber.trim(),
-      wavelengthRange: range,
-    });
-  } catch (err) {
-    return errorResponse(err);
-  }
+export async function GET(request: NextRequest): Promise<Response> {
+  return proxyToAcquisition(request, '/h1/info');
 }

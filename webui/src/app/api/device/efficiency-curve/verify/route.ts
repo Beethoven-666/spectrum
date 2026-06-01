@@ -1,16 +1,10 @@
-import { ensureAutoConnect, requireDevice } from '@/lib/device-manager';
-import { errorResponse } from '@/lib/api-errors';
+import type { NextRequest } from 'next/server';
+
+import { proxyToAcquisition } from '@/lib/acquisition-proxy';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-export async function POST(): Promise<Response> {
-  try {
-    await ensureAutoConnect();
-    const device = requireDevice();
-    await device.verifyAndComputeEfficiencyCurve();
-    return Response.json({ ok: true });
-  } catch (err) {
-    return errorResponse(err);
-  }
+export async function POST(request: NextRequest): Promise<Response> {
+  return proxyToAcquisition(request, '/h1/efficiency-curve/verify');
 }

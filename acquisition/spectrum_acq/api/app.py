@@ -13,6 +13,7 @@ import numpy as np
 from PIL import Image
 
 from spectrum_acq import __version__
+from spectrum_acq.api.h1_routes import register_h1_routes
 from spectrum_acq.capture.coordinator import CaptureCoordinator, create_default_coordinator
 from spectrum_acq.config import load_config, save_config
 from spectrum_acq.models import AcquisitionConfig, Roi, to_jsonable
@@ -53,30 +54,7 @@ def create_app(config: AcquisitionConfig | None = None) -> FastAPI:
     def devices() -> dict[str, Any]:
         return to_jsonable(coordinator.devices())
 
-    @app.get("/h1/stream")
-    def h1_stream(
-        tm30: bool = Query(default=False),
-        max_frames: int | None = Query(default=None, ge=1, le=1000),
-    ) -> StreamingResponse:
-        def stream():
-            yield ": ok\n\n"
-            try:
-                for frame in coordinator.stream_h1(include_tm30=tm30, max_frames=max_frames):
-                    payload = json.dumps(to_jsonable(frame), ensure_ascii=False)
-                    yield f"event: frame\ndata: {payload}\n\n"
-            except Exception as exc:  # noqa: BLE001 - SSE clients need an event payload
-                payload = json.dumps({"error": str(exc)}, ensure_ascii=False)
-                yield f"event: error\ndata: {payload}\n\n"
-
-        return StreamingResponse(
-            stream(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache, no-transform",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
-        )
+    register_h1_routes(app, coordinator)
 
     @app.get("/storage")
     def storage() -> dict[str, Any]:

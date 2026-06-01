@@ -24,16 +24,27 @@ export class ApiCallError extends Error {
 }
 
 async function parseError(res: Response): Promise<ApiCallError> {
-  let body: { error?: string; detail?: string; code?: number; cmdType?: number } = {};
+  let body: {
+    error?: string;
+    detail?: string | { error?: string; code?: number; cmdType?: number };
+    code?: number;
+    cmdType?: number;
+  } = {};
   try {
     body = await res.json();
   } catch {
     body = { error: res.statusText || `HTTP ${res.status}` };
   }
+  const nested =
+    typeof body.detail === 'object' && body.detail !== null ? body.detail : undefined;
   return new ApiCallError({
-    error: body.error ?? body.detail ?? `HTTP ${res.status}`,
-    code: body.code,
-    cmdType: body.cmdType,
+    error:
+      body.error ??
+      nested?.error ??
+      (typeof body.detail === 'string' ? body.detail : undefined) ??
+      `HTTP ${res.status}`,
+    code: body.code ?? nested?.code,
+    cmdType: body.cmdType ?? nested?.cmdType,
     status: res.status,
   });
 }

@@ -29,6 +29,10 @@ class MockH1Spectrometer:
         self.wavelength_start = 340
         self.wavelength_end = 1050
         self._last_exposure_us = 50_000
+        self._exposure_mode = "manual"
+        self._max_exposure_us = 1_000_000
+        self._cie_mode = "cie1931_2"
+        self._working_mode = "streaming"
 
     def status(self) -> H1Status:
         return H1Status(
@@ -108,6 +112,64 @@ class MockH1Spectrometer:
             yield h1_capture_to_stream_frame(capture, include_tm30=include_tm30)
             emitted += 1
             time.sleep(0.1)
+
+    def device_info(self) -> dict[str, Any]:
+        return {
+            "serialNumber": self.serial_number,
+            "wavelengthRange": {"start": self.wavelength_start, "end": self.wavelength_end},
+        }
+
+    def get_exposure(self) -> dict[str, Any]:
+        return {
+            "mode": self._exposure_mode,
+            "timeUs": self._last_exposure_us,
+            "maxTimeUs": self._max_exposure_us,
+        }
+
+    def patch_exposure(
+        self,
+        *,
+        mode: str | None = None,
+        time_us: int | None = None,
+        max_time_us: int | None = None,
+    ) -> dict[str, Any]:
+        if mode is not None:
+            self._exposure_mode = mode
+        if time_us is not None:
+            self._last_exposure_us = int(time_us)
+        if max_time_us is not None:
+            self._max_exposure_us = int(max_time_us)
+        return self.get_exposure()
+
+    def get_cie_mode(self) -> dict[str, str]:
+        return {"mode": self._cie_mode}
+
+    def set_cie_mode(self, mode_name: str) -> dict[str, str]:
+        self._cie_mode = mode_name
+        return self.get_cie_mode()
+
+    def set_working_mode(self, mode: str) -> dict[str, str]:
+        self._working_mode = mode
+        return {"mode": mode}
+
+    def enter_sleep(self) -> dict[str, Any]:
+        return {"ok": True, "state": "sleeping"}
+
+    def exit_sleep(self) -> dict[str, Any]:
+        return {"ok": True, "state": "awake"}
+
+    def capture_single_frame(self, *, include_tm30: bool = False) -> dict[str, Any]:
+        capture = self.capture_auto(H1AutoExposureConfig())
+        return h1_capture_to_stream_frame(capture, include_tm30=include_tm30)
+
+    def upload_efficiency_curve(self, ratios: list[float]) -> dict[str, Any]:
+        return {"ok": True, "count": len(ratios)}
+
+    def verify_efficiency_curve(self) -> dict[str, Any]:
+        return {"ok": True}
+
+    def reset_efficiency_curve(self) -> dict[str, Any]:
+        return {"ok": True}
 
     def _status_sequence(self, max_attempts: int) -> list[str]:
         if self.scenario == "under_then_normal":

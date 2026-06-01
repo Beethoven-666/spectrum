@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import math
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -154,4 +156,11 @@ def to_jsonable(value: Any) -> Any:
         return {str(k): to_jsonable(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [to_jsonable(v) for v in value]
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
     return value
+
+
+def json_dumps(value: Any, **kwargs: Any) -> str:
+    """Serialize API payloads as strict JSON (no NaN/Infinity tokens)."""
+    return json.dumps(to_jsonable(value), ensure_ascii=False, allow_nan=False, **kwargs)

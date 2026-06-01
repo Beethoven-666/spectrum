@@ -62,6 +62,42 @@ def test_api_mock_capture_roundtrip(tmp_path: Path) -> None:
     assert missing.status_code == 404
 
 
+def test_h1_gateway_endpoints(tmp_path: Path) -> None:
+    app = create_app(default_config(tmp_path / "data"))
+    client = TestClient(app)
+
+    info = client.get("/h1/info")
+    assert info.status_code == 200
+    assert info.json()["serialNumber"] == "MOCK-H1-0001"
+
+    exposure = client.get("/h1/exposure")
+    assert exposure.status_code == 200
+    assert exposure.json()["mode"] in {"auto", "manual"}
+
+    patched = client.patch("/h1/exposure", json={"timeUs": 120_000})
+    assert patched.status_code == 200
+    assert patched.json()["timeUs"] == 120_000
+
+    cie = client.get("/h1/cie-mode")
+    assert cie.status_code == 200
+    assert "mode" in cie.json()
+
+    capture = client.post("/h1/capture")
+    assert capture.status_code == 200
+    assert "rawSpectrum" in capture.json()
+
+    sleep = client.post("/h1/sleep")
+    assert sleep.status_code == 200
+    assert sleep.json()["ok"] is True
+
+    wake = client.post("/h1/wake")
+    assert wake.status_code == 200
+
+    curve = client.post("/h1/efficiency-curve", json={"ratios": [1.0, 1.1, 0.9]})
+    assert curve.status_code == 200
+    assert curve.json()["count"] == 3
+
+
 def test_h1_stream_sse_uses_acquisition_device(tmp_path: Path) -> None:
     app = create_app(default_config(tmp_path / "data"))
     client = TestClient(app)

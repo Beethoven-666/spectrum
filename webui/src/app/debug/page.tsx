@@ -55,7 +55,7 @@ export default function DebugDashboardPage(): React.ReactElement {
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">本机 H1 调试仪表盘</h1>
         <p className="text-sm text-muted-foreground">
-          直连本机串口，用于单独调试 @h1/sdk；树莓派硬件数据默认在多模态采集页面查看。
+          经 acquisition 服务访问 H1，用于单帧调试与曝光参数查看；多模态采集请使用采集页。
         </p>
       </div>
 
@@ -148,7 +148,7 @@ export default function DebugDashboardPage(): React.ReactElement {
                   尚未采集任何帧，点击右上角按钮开始。
                 </>
               ) : (
-                '请先在顶部连接本机 H1 设备。'
+                '请确认 acquisition 服务在线且 H1 已就绪。'
               )}
             </div>
           )}

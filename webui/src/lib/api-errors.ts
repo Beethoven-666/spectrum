@@ -4,8 +4,6 @@
 
 import { DeviceError, H1Error } from '@h1/sdk';
 
-import { NotConnectedError } from './device-manager';
-
 interface ErrorBody {
   error: string;
   code?: number;
@@ -13,10 +11,6 @@ interface ErrorBody {
 }
 
 export function errorResponse(err: unknown): Response {
-  if (err instanceof NotConnectedError) {
-    const body: ErrorBody = { error: err.message };
-    return Response.json(body, { status: 409 });
-  }
   if (err instanceof DeviceError) {
     const body: ErrorBody = {
       error: err.message,

@@ -1,24 +1,10 @@
-import { WorkingMode } from '@h1/sdk';
+import type { NextRequest } from 'next/server';
 
-import { ensureAutoConnect, requireDevice } from '@/lib/device-manager';
-import { errorResponse } from '@/lib/api-errors';
+import { proxyToAcquisition } from '@/lib/acquisition-proxy';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-interface Body {
-  mode: 'streaming' | 'trigger';
-}
-
-export async function PUT(request: Request): Promise<Response> {
-  try {
-    await ensureAutoConnect();
-    const device = requireDevice();
-    const body = (await request.json()) as Body;
-    const num = body.mode === 'trigger' ? WorkingMode.Trigger : WorkingMode.Streaming;
-    await device.setWorkingMode(num);
-    return Response.json({ mode: body.mode });
-  } catch (err) {
-    return errorResponse(err);
-  }
+export async function PUT(request: NextRequest): Promise<Response> {
+  return proxyToAcquisition(request, '/h1/working-mode', { method: 'PUT', body: request.body });
 }

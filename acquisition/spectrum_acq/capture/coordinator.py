@@ -94,6 +94,58 @@ class CaptureCoordinator:
         finally:
             self._lock.release()
 
+    def _run_h1_locked(self, fn, *, timeout: float = 5.0):
+        if not self._lock.acquire(timeout=timeout):
+            raise RuntimeError("capture busy")
+        try:
+            return fn()
+        finally:
+            self._lock.release()
+
+    def h1_device_info(self) -> dict[str, Any]:
+        return self._run_h1_locked(self.h1.device_info)
+
+    def h1_get_exposure(self) -> dict[str, Any]:
+        return self._run_h1_locked(self.h1.get_exposure)
+
+    def h1_patch_exposure(
+        self,
+        *,
+        mode: str | None = None,
+        time_us: int | None = None,
+        max_time_us: int | None = None,
+    ) -> dict[str, Any]:
+        return self._run_h1_locked(
+            lambda: self.h1.patch_exposure(mode=mode, time_us=time_us, max_time_us=max_time_us)
+        )
+
+    def h1_get_cie_mode(self) -> dict[str, str]:
+        return self._run_h1_locked(self.h1.get_cie_mode)
+
+    def h1_set_cie_mode(self, mode_name: str) -> dict[str, str]:
+        return self._run_h1_locked(lambda: self.h1.set_cie_mode(mode_name))
+
+    def h1_set_working_mode(self, mode: str) -> dict[str, str]:
+        return self._run_h1_locked(lambda: self.h1.set_working_mode(mode))
+
+    def h1_enter_sleep(self) -> dict[str, Any]:
+        return self._run_h1_locked(self.h1.enter_sleep)
+
+    def h1_exit_sleep(self) -> dict[str, Any]:
+        return self._run_h1_locked(self.h1.exit_sleep)
+
+    def h1_capture_single(self, *, include_tm30: bool = False) -> dict[str, Any]:
+        return self._run_h1_locked(lambda: self.h1.capture_single_frame(include_tm30=include_tm30))
+
+    def h1_upload_efficiency_curve(self, ratios: list[float]) -> dict[str, Any]:
+        return self._run_h1_locked(lambda: self.h1.upload_efficiency_curve(ratios))
+
+    def h1_verify_efficiency_curve(self) -> dict[str, Any]:
+        return self._run_h1_locked(self.h1.verify_efficiency_curve)
+
+    def h1_reset_efficiency_curve(self) -> dict[str, Any]:
+        return self._run_h1_locked(self.h1.reset_efficiency_curve)
+
     def capture(
         self,
         *,

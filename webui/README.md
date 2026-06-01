@@ -1,23 +1,19 @@
 # Spectrum 采集台 (`h1-webui`)
 
 基于 Next.js 16 (App Router) + shadcn/ui 的树莓派 H1 + D455 多模态采集 Web UI。
-默认入口连接 Python acquisition service，展示树莓派上的真实硬件状态。
-本机 H1 调试页仍复用本仓库的 [`@h1/sdk`](../sdk/nodejs/) 进行协议通信。
+所有 H1 操作经 Python acquisition service 网关，Web UI 不直接打开串口。
 
 ## 模式
 
 - **树莓派真实采集（默认）**：`/acquisition` 通过 `ACQUISITION_API_BASE_URL` 访问 acquisition service，读取真实 H1/D455 状态。
-- **本机 H1 串口调试**：进入 `/debug`、`/stream`、`/capture` 等本机调试页后，优先通过环境变量 `H1_PORT=/dev/cu.usbserial-XXXX` 自动连接；未设置时会扫描常见 USB 串口并通过 H1 握手确认，或在顶部"连接"侧栏中选择"串口"页签手动指定。
-- **Mock 模式（显式）**：只有设置 `H1_MOCK=1` 或在顶部连接侧栏中手动选择 Mock 时，才使用内置 `MockSerialPort`。
+- **H1 调试页**：`/debug`、`/capture`、`/settings`、`/curve` 等页面的 `/api/device/*` 路由代理到 acquisition `/h1/*`，与采集页共用同一串口锁。
+- **Mock 模式**：启动 acquisition 时加 `--mock`（或配置 `mock: true`），Web UI 无需额外环境变量。
 
 ## 环境变量
 
 | 变量 | 含义 | 默认 |
 | --- | --- | --- |
 | `ACQUISITION_API_BASE_URL` | acquisition service 地址 | `http://127.0.0.1:8000` |
-| `H1_MOCK` | 设为 `1` 时强制本机调试页 Mock | 未设置时不 mock |
-| `H1_PORT` | 本机调试页真实串口路径 | 未设置时自动扫描常见 USB 串口 |
-| `H1_AUTO_CONNECT` | 设为 `0` 时关闭未配置串口的自动扫描 | 未设置时开启 |
 
 ## 开发
 
@@ -28,10 +24,9 @@
 npm install
 npm run build:sdk
 
-# 2) 启动 dev server（默认访问 acquisition service）
+# 2) 启动 dev server（需 acquisition service 在线）
 npm run dev:webui
-# 本机 SDK mock 调试需要显式开启：
-# H1_MOCK=1 npm run dev -w h1-webui
+# Mock：在另一终端启动 acquisition --mock
 
 # 3) 构建
 npm run build:webui
@@ -55,10 +50,8 @@ npm run build:webui
 ## API（部分）
 
 ```text
-GET    /api/connection                   连接状态
-POST   /api/connection                   {mode:'mock'|'serial', port?}
-DELETE /api/connection                   断开
-GET    /api/device/info                  SN + 波长范围
+GET    /api/connection                   acquisition H1 网关状态
+GET    /api/device/info                  SN + 波长范围（代理 /h1/info）
 GET    /api/device/exposure              {mode,timeUs,maxTimeUs}
 PATCH  /api/device/exposure              部分字段
 GET    /api/device/cie-mode

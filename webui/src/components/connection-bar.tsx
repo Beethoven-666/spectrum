@@ -1,182 +1,30 @@
 'use client';
 
 import useSWR from 'swr';
-import { Camera, Database, Plug, PlugZap, RotateCcw, SatelliteDish } from 'lucide-react';
-import { useEffect, useState } from 'react';
-import { usePathname } from 'next/navigation';
-import { toast } from 'sonner';
+import { Camera, Database, RotateCcw, SatelliteDish } from 'lucide-react';
+import { useEffect } from 'react';
 
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
-import {
-  Sheet,
-  SheetClose,
-  SheetContent,
-  SheetDescription,
-  SheetFooter,
-  SheetHeader,
-  SheetTitle,
-  SheetTrigger,
-} from '@/components/ui/sheet';
 import { SidebarTrigger } from '@/components/ui/sidebar';
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import {
   acquisitionPath,
   type AcquisitionDevices,
   type AcquisitionHealth,
 } from '@/lib/acquisition-client';
-import { ApiCallError, apiSend, fetcher } from '@/lib/api-client';
+import { fetcher } from '@/lib/api-client';
 import type { ConnectionStatus } from '@/lib/device-manager';
 import { useConnectionStore } from '@/store/connection';
 
 import { ThemeToggle } from './theme-toggle';
 
 export function ConnectionBar(): React.ReactElement {
-  const pathname = usePathname();
-  if (pathname.startsWith('/acquisition') || pathname.startsWith('/stream')) {
-    return <AcquisitionConnectionBar />;
-  }
-  return <H1ConnectionBar />;
-}
-
-function H1ConnectionBar(): React.ReactElement {
-  const { setStatus, status } = useConnectionStore();
-  const { data, mutate } = useSWR<ConnectionStatus>('/api/connection', fetcher, {
-    refreshInterval: 5_000,
-  });
-  useEffect(() => {
-    if (data) setStatus(data);
-  }, [data, setStatus]);
-
-  const [open, setOpen] = useState(false);
-  const [mode, setMode] = useState<'mock' | 'serial'>('mock');
-  const [port, setPort] = useState('');
-  const [pending, setPending] = useState(false);
-
-  const handleConnect = async (): Promise<void> => {
-    setPending(true);
-    try {
-      const serialPort = port.trim();
-      const next = await apiSend<ConnectionStatus>(
-        '/api/connection',
-        'POST',
-        mode === 'mock'
-          ? { mode: 'mock' }
-          : { mode: 'serial', ...(serialPort ? { port: serialPort } : {}) },
-      );
-      setStatus(next);
-      await mutate(next);
-      toast.success(mode === 'mock' ? '已连接到 Mock 设备' : `已连接 ${next.port ?? serialPort}`);
-      setOpen(false);
-    } catch (err) {
-      const msg = err instanceof ApiCallError ? err.message : String(err);
-      toast.error(`连接失败：${msg}`);
-    } finally {
-      setPending(false);
-    }
-  };
-
-  const handleDisconnect = async (): Promise<void> => {
-    setPending(true);
-    try {
-      const next = await apiSend<ConnectionStatus>('/api/connection', 'DELETE');
-      setStatus(next);
-      await mutate(next);
-      toast.success('已断开连接');
-    } catch (err) {
-      const msg = err instanceof ApiCallError ? err.message : String(err);
-      toast.error(`断开失败：${msg}`);
-    } finally {
-      setPending(false);
-    }
-  };
-
-  const connected = status.connected;
-  return (
-    <header className="sticky top-0 z-40 flex h-14 items-center gap-3 border-b bg-background/95 px-4 backdrop-blur supports-[backdrop-filter]:bg-background/60">
-      <SidebarTrigger />
-      <div className="flex items-center gap-2">
-        <Badge variant={connected ? 'default' : 'secondary'} className="gap-1">
-          {connected ? <PlugZap className="h-3 w-3" /> : <Plug className="h-3 w-3" />}
-          {connected ? '已连接' : '未连接'}
-        </Badge>
-        {connected ? (
-          <span className="text-xs text-muted-foreground">
-            H1 调试连接 · {status.mode === 'mock' ? 'Mock 模式' : '串口'} · {status.port ?? ''}
-          </span>
-        ) : (
-          <span className="text-xs text-muted-foreground">H1 调试连接未打开</span>
-        )}
-      </div>
-      <div className="ml-auto flex items-center gap-2">
-        <Button
-          variant="ghost"
-          size="icon"
-          aria-label="刷新状态"
-          onClick={() => void mutate()}
-        >
-          <RotateCcw className="h-4 w-4" />
-        </Button>
-        {connected ? (
-          <Button variant="outline" size="sm" disabled={pending} onClick={() => void handleDisconnect()}>
-            断开
-          </Button>
-        ) : null}
-        <Sheet open={open} onOpenChange={setOpen}>
-          <SheetTrigger
-            render={
-              <Button size="sm" disabled={pending}>
-                {connected ? '切换连接' : '连接'}
-              </Button>
-            }
-          />
-          <SheetContent className="w-full sm:max-w-md">
-            <SheetHeader>
-              <SheetTitle>连接 H1 光谱仪</SheetTitle>
-              <SheetDescription>
-                选择 Mock 模拟设备或指定真实串口。Mock 模式不需要任何硬件。
-              </SheetDescription>
-            </SheetHeader>
-            <div className="space-y-4 px-4 pb-4">
-              <Tabs value={mode} onValueChange={(v) => setMode(v as 'mock' | 'serial')}>
-                <TabsList className="grid w-full grid-cols-2">
-                  <TabsTrigger value="mock">Mock</TabsTrigger>
-                  <TabsTrigger value="serial">串口</TabsTrigger>
-                </TabsList>
-                <TabsContent value="mock" className="mt-3 text-sm text-muted-foreground">
-                  使用内置 MockSerialPort，自动响应全部 20 条命令，光谱由 5500K 暖白 LED 合成器实时生成。
-                </TabsContent>
-                <TabsContent value="serial" className="mt-3 space-y-2">
-                  <Label htmlFor="port-path">串口路径</Label>
-                  <Input
-                    id="port-path"
-                    value={port}
-                    onChange={(e) => setPort(e.target.value)}
-                    placeholder="/dev/cu.usbserial-XXXX 或 COM3"
-                  />
-                  <p className="text-xs text-muted-foreground">
-                    留空时自动扫描常见 USB 串口，并通过 H1 设备握手确认。将以 115200 8N1 打开。
-                  </p>
-                </TabsContent>
-              </Tabs>
-            </div>
-            <SheetFooter>
-              <SheetClose render={<Button variant="ghost">取消</Button>} />
-              <Button disabled={pending} onClick={() => void handleConnect()}>
-                {pending ? '连接中…' : '连接'}
-              </Button>
-            </SheetFooter>
-          </SheetContent>
-        </Sheet>
-        <ThemeToggle />
-      </div>
-    </header>
+  const { setStatus } = useConnectionStore();
+  const { data: connection, mutate: refreshConnection } = useSWR<ConnectionStatus>(
+    '/api/connection',
+    fetcher,
+    { refreshInterval: 5_000 },
   );
-}
-
-function AcquisitionConnectionBar(): React.ReactElement {
   const { data: health, mutate: refreshHealth } = useSWR<AcquisitionHealth>(
     acquisitionPath('/health'),
     fetcher,
@@ -188,8 +36,12 @@ function AcquisitionConnectionBar(): React.ReactElement {
     { refreshInterval: 5_000 },
   );
 
+  useEffect(() => {
+    if (connection) setStatus(connection);
+  }, [connection, setStatus]);
+
   const refresh = async (): Promise<void> => {
-    await Promise.all([refreshHealth(), refreshDevices()]);
+    await Promise.all([refreshConnection(), refreshHealth(), refreshDevices()]);
   };
 
   const serviceReady = health?.ok === true;
@@ -208,11 +60,11 @@ function AcquisitionConnectionBar(): React.ReactElement {
         <DeviceBadge icon={<Camera className="h-3 w-3" />} label="RGB" status={devices?.main_rgb?.status} missingLabel="待接入" />
         <span className="truncate text-xs text-muted-foreground">
           {serviceReady ? (health.mock ? 'mock' : 'hardware') : 'waiting'} · H1{' '}
-          {devices?.h1?.serial_number ?? '-'} · D455 {devices?.d455?.serial ?? '-'}
+          {devices?.h1?.serial_number ?? connection?.serialNumber ?? '-'} · D455 {devices?.d455?.serial ?? '-'}
         </span>
       </div>
       <div className="ml-auto flex items-center gap-2">
-        <Button variant="ghost" size="icon" aria-label="刷新采集状态" onClick={() => void refresh()}>
+        <Button variant="ghost" size="icon" aria-label="刷新设备状态" onClick={() => void refresh()}>
           <RotateCcw className="h-4 w-4" />
         </Button>
         <ThemeToggle />
