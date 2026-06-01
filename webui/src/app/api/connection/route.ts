@@ -1,7 +1,7 @@
 /**
  * Connection lifecycle.
  *  GET    → current status
- *  POST   → connect (body: {mode:'mock'} | {mode:'serial',port})
+ *  POST   → connect (body: {mode:'mock'} | {mode:'serial',port?})
  *  DELETE → disconnect
  */
 
@@ -30,9 +30,6 @@ export async function POST(request: Request): Promise<Response> {
     const body = (await request.json()) as ConnectBody;
     if (body.mode !== 'mock' && body.mode !== 'serial') {
       return Response.json({ error: 'mode must be "mock" or "serial"' }, { status: 400 });
-    }
-    if (body.mode === 'serial' && !body.port) {
-      return Response.json({ error: 'serial mode requires "port"' }, { status: 400 });
     }
     const status = await connect(body);
     return Response.json(status);

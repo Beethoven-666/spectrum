@@ -52,20 +52,23 @@ function H1ConnectionBar(): React.ReactElement {
 
   const [open, setOpen] = useState(false);
   const [mode, setMode] = useState<'mock' | 'serial'>('mock');
-  const [port, setPort] = useState('/dev/cu.usbserial-XXXX');
+  const [port, setPort] = useState('');
   const [pending, setPending] = useState(false);
 
   const handleConnect = async (): Promise<void> => {
     setPending(true);
     try {
+      const serialPort = port.trim();
       const next = await apiSend<ConnectionStatus>(
         '/api/connection',
         'POST',
-        mode === 'mock' ? { mode: 'mock' } : { mode: 'serial', port },
+        mode === 'mock'
+          ? { mode: 'mock' }
+          : { mode: 'serial', ...(serialPort ? { port: serialPort } : {}) },
       );
       setStatus(next);
       await mutate(next);
-      toast.success(mode === 'mock' ? '已连接到 Mock 设备' : `已连接 ${port}`);
+      toast.success(mode === 'mock' ? '已连接到 Mock 设备' : `已连接 ${next.port ?? serialPort}`);
       setOpen(false);
     } catch (err) {
       const msg = err instanceof ApiCallError ? err.message : String(err);
@@ -154,7 +157,7 @@ function H1ConnectionBar(): React.ReactElement {
                     placeholder="/dev/cu.usbserial-XXXX 或 COM3"
                   />
                   <p className="text-xs text-muted-foreground">
-                    将以 115200 8N1 打开。需要硬件已插入并被系统识别。
+                    留空时自动扫描常见 USB 串口，并通过 H1 设备握手确认。将以 115200 8N1 打开。
                   </p>
                 </TabsContent>
               </Tabs>

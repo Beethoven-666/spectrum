@@ -1,6 +1,7 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
+  serverExternalPackages: ["@h1/sdk", "serialport"],
   async redirects() {
     return [
       {

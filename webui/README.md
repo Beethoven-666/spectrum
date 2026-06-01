@@ -7,7 +7,7 @@
 ## 模式
 
 - **树莓派真实采集（默认）**：`/acquisition` 通过 `ACQUISITION_API_BASE_URL` 访问 acquisition service，读取真实 H1/D455 状态。
-- **本机 H1 串口调试**：进入 `/debug`、`/stream`、`/capture` 等本机调试页后，通过环境变量 `H1_PORT=/dev/cu.usbserial-XXXX` 自动连接，或在顶部"连接"侧栏中选择"串口"页签。
+- **本机 H1 串口调试**：进入 `/debug`、`/stream`、`/capture` 等本机调试页后，优先通过环境变量 `H1_PORT=/dev/cu.usbserial-XXXX` 自动连接；未设置时会扫描常见 USB 串口并通过 H1 握手确认，或在顶部"连接"侧栏中选择"串口"页签手动指定。
 - **Mock 模式（显式）**：只有设置 `H1_MOCK=1` 或在顶部连接侧栏中手动选择 Mock 时，才使用内置 `MockSerialPort`。
 
 ## 环境变量
@@ -16,7 +16,8 @@
 | --- | --- | --- |
 | `ACQUISITION_API_BASE_URL` | acquisition service 地址 | `http://127.0.0.1:8000` |
 | `H1_MOCK` | 设为 `1` 时强制本机调试页 Mock | 未设置时不 mock |
-| `H1_PORT` | 本机调试页真实串口路径 | 未设置时保持未连接 |
+| `H1_PORT` | 本机调试页真实串口路径 | 未设置时自动扫描常见 USB 串口 |
+| `H1_AUTO_CONNECT` | 设为 `0` 时关闭未配置串口的自动扫描 | 未设置时开启 |
 
 ## 开发
 
