@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -30,15 +31,21 @@ def create_app(config: AcquisitionConfig | None = None) -> FastAPI:
     save_config(active_config)
     coordinator = create_default_coordinator(active_config)
 
-    app = FastAPI(title="spectrum-acq", version=__version__)
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        try:
+            yield
+        finally:
+            coordinator.close()
+
+    app = FastAPI(title="spectrum-acq", version=__version__, lifespan=lifespan)
     app.state.config = active_config
     app.state.coordinator = coordinator
 
     def apply_config(next_config: AcquisitionConfig) -> None:
         nonlocal active_config
         active_config = next_config
-        coordinator.config = next_config
-        coordinator.store.config = next_config
+        coordinator.apply_config(next_config)
         app.state.config = next_config
 
     @app.get("/health")
@@ -74,9 +81,12 @@ def create_app(config: AcquisitionConfig | None = None) -> FastAPI:
         next_config = load_config(cfg_path, data_dir=active_config.data_dir)
         save_config(next_config)
         apply_config(next_config)
+        # d455_profile / main_rgb_profile / streaming now hot-apply via
+        # coordinator.apply_config (camera workers rebuild), so they are no
+        # longer restart-required. mock / data_dir / h1_port still are.
         restart_required = any(
             current_payload.get(field) != to_jsonable(next_config).get(field)
-            for field in ["mock", "data_dir", "h1_port", "d455_profile"]
+            for field in ["mock", "data_dir", "h1_port"]
         )
         return {
             "ok": True,
@@ -211,7 +221,9 @@ def register_preview_routes(app: FastAPI, coordinator: CaptureCoordinator) -> No
 
     @app.get("/preview/d455/frame")
     def preview_d455_frame() -> Response:
-        snapshot = coordinator.d455.snapshot()
+        snapshot = coordinator.d455.preview()
+        if snapshot is None:
+            raise HTTPException(status_code=503, detail="d455 warming up")
         image = Image.fromarray(snapshot.color_rgb, mode="RGB")
         import io
 
@@ -221,7 +233,9 @@ def register_preview_routes(app: FastAPI, coordinator: CaptureCoordinator) -> No
 
     @app.get("/preview/d455/depth")
     def preview_d455_depth() -> Response:
-        snapshot = coordinator.d455.snapshot()
+        snapshot = coordinator.d455.preview()
+        if snapshot is None:
+            raise HTTPException(status_code=503, detail="d455 warming up")
         import io
 
         depth = snapshot.depth_mm.astype("float32")
@@ -236,6 +250,39 @@ def register_preview_routes(app: FastAPI, coordinator: CaptureCoordinator) -> No
         buf = io.BytesIO()
         image.save(buf, format="PNG")
         return Response(content=buf.getvalue(), media_type="image/png")
+
+    @app.get("/preview/d455/imu")
+    def preview_d455_imu() -> dict[str, Any]:
+        try:
+            snapshot = coordinator.d455.preview()
+        except Exception as exc:  # noqa: BLE001 - surface to the attitude indicator as JSON
+            return {"available": False, "enabled": False, "error": str(exc)}
+        if snapshot is None:
+            return {
+                "available": False,
+                "enabled": coordinator.config.d455_profile.enable_imu,
+                "error": "warming up",
+            }
+        return to_jsonable(snapshot.imu)
+
+    @app.get("/preview/main_rgb/status")
+    def preview_main_rgb_status() -> dict[str, Any]:
+        return to_jsonable(coordinator.main_rgb.status())
+
+    @app.get("/preview/main_rgb/frame")
+    def preview_main_rgb_frame() -> Response:
+        capture = coordinator.main_rgb.preview()
+        if capture is None or capture.image_rgb is None:
+            detail = "main RGB unavailable"
+            if capture is not None:
+                detail = capture.metadata.get("error") or capture.metadata.get("reason") or detail
+            raise HTTPException(status_code=503, detail=detail)
+        import io
+
+        image = Image.fromarray(capture.image_rgb, mode="RGB")
+        buf = io.BytesIO()
+        image.save(buf, format="JPEG", quality=85)
+        return Response(content=buf.getvalue(), media_type="image/jpeg")
 
 
 def _read_json(path: Path) -> Any:

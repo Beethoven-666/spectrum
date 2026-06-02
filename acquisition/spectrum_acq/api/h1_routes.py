@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
-from typing import Any
+import queue
+import threading
+from typing import Any, Iterator
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -98,22 +101,29 @@ def register_h1_routes(app: FastAPI, coordinator: CaptureCoordinator) -> None:
         return _run_h1(coordinator, coordinator.h1_reset_efficiency_curve)
 
     @app.get("/h1/stream")
-    def h1_stream(
+    async def h1_stream(
         tm30: bool = Query(default=False),
         max_frames: int | None = Query(default=None, ge=1, le=1000),
     ) -> StreamingResponse:
-        def stream():
-            yield ": ok\n\n"
-            try:
-                for frame in coordinator.stream_h1(include_tm30=tm30, max_frames=max_frames):
-                    payload = json_dumps(frame)
-                    yield f"event: frame\ndata: {payload}\n\n"
-            except Exception as exc:  # noqa: BLE001 - SSE clients need an event payload
-                payload = json.dumps({"error": str(exc)}, ensure_ascii=False)
-                yield f"event: error\ndata: {payload}\n\n"
-
+        # The H1 SDK stream generator holds the device lock (a threading.RLock)
+        # across the whole stream and releases it in its ``finally``. An RLock may
+        # only be released by the thread that acquired it. Starlette drives a *sync*
+        # generator across rotating threadpool threads, so the acquire and the
+        # teardown release would land on different threads -> "cannot release
+        # un-acquired lock", leaving the device lock wedged (every later call 409s
+        # and the next stream's auto-exposure prime blocks forever).
+        #
+        # Fix: run the blocking device stream on ONE dedicated worker thread, so
+        # acquire + release + gen.close() all happen on the same thread, and bridge
+        # frames to the async SSE response through a queue. On client disconnect the
+        # async generator's ``finally`` sets the stop flag; the worker then closes
+        # the generator on its own thread, sending CMD 0x04 and releasing the lock
+        # cleanly (PROTOCOL.md §8.2/§8.4).
+        events = _bridge_sync_stream(
+            lambda: coordinator.stream_h1(include_tm30=tm30, max_frames=max_frames)
+        )
         return StreamingResponse(
-            stream(),
+            events,
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache, no-transform",
@@ -121,6 +131,76 @@ def register_h1_routes(app: FastAPI, coordinator: CaptureCoordinator) -> None:
                 "X-Accel-Buffering": "no",
             },
         )
+
+
+def _bridge_sync_stream(make_gen, *, maxsize: int = 32):
+    """Bridge a blocking sync frame-generator to an async SSE event generator.
+
+    The sync generator (which holds the device lock for its lifetime) is iterated
+    entirely on one dedicated worker thread, so it is also *closed* on that thread
+    — keeping the lock acquire/release on the same thread. Frames flow to the event
+    loop through a bounded queue; client disconnect stops the worker deterministically.
+    """
+    q: "queue.Queue[tuple[str, str] | None]" = queue.Queue(maxsize=maxsize)
+    stop = threading.Event()
+    SENTINEL = None
+
+    def producer() -> None:
+        gen: Iterator[dict[str, Any]] = make_gen()
+        try:
+            for frame in gen:
+                if stop.is_set():
+                    break
+                payload = json_dumps(frame)
+                # Backpressure-aware put that still notices a gone consumer.
+                while not stop.is_set():
+                    try:
+                        q.put(("frame", payload), timeout=1.0)
+                        break
+                    except queue.Full:
+                        continue
+        except Exception as exc:  # noqa: BLE001 - SSE clients need an event payload
+            try:
+                q.put(("error", json.dumps({"error": str(exc)}, ensure_ascii=False)), timeout=1.0)
+            except queue.Full:
+                pass
+        finally:
+            # Runs the SDK + coordinator ``finally`` blocks on THIS thread: sends
+            # CMD 0x04 and releases the device/coordinator locks on the acquiring
+            # thread.
+            gen.close()
+            try:
+                q.put(SENTINEL, timeout=1.0)
+            except queue.Full:
+                pass
+
+    thread = threading.Thread(target=producer, name="h1-stream", daemon=True)
+    thread.start()
+
+    async def event_stream():
+        loop = asyncio.get_running_loop()
+        try:
+            yield ": ok\n\n"
+            while True:
+                item = await loop.run_in_executor(None, q.get)
+                if item is SENTINEL:
+                    break
+                kind, payload = item
+                if kind == "error":
+                    yield f"event: error\ndata: {payload}\n\n"
+                    break
+                yield f"event: frame\ndata: {payload}\n\n"
+        finally:
+            # Client disconnected or stream ended: tell the worker to stop and drain
+            # the queue so its puts unblock and it can close the generator cleanly.
+            stop.set()
+            try:
+                while q.get_nowait() is not SENTINEL:
+                    pass
+            except queue.Empty:
+                pass
+
+    return event_stream()
 
 
 def _run_h1(coordinator: CaptureCoordinator, fn):

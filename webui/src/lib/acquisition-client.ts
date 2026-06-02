@@ -11,6 +11,15 @@ export interface AcquisitionDevices {
   main_rgb: DeviceInfo;
 }
 
+export interface CameraHealth {
+  reconnecting?: boolean;
+  consecutive_failures?: number;
+  last_error?: string | null;
+  frames_published?: number;
+  frame_age_s?: number | null;
+  decode_failures?: number;
+}
+
 export interface DeviceInfo {
   status: string;
   name?: string;
@@ -21,6 +30,7 @@ export interface DeviceInfo {
   exposure_mode?: string | null;
   max_exposure_time_us?: number | null;
   detail?: Record<string, unknown>;
+  health?: CameraHealth;
 }
 
 export interface StorageStatus {
@@ -58,6 +68,8 @@ export interface AcquisitionConfig {
     min_exposure_us: number;
     max_exposure_us: number;
     initial_exposure_us: number;
+    multi_exposure_steps: number;
+    stream_max_exposure_us?: number;
   };
   quality: {
     min_depth_valid_ratio: number;
@@ -155,6 +167,16 @@ export interface CaptureStatePayload {
   state: string;
   sample_id?: string | null;
   error?: string | null;
+}
+
+export interface D455ImuPayload {
+  available?: boolean;
+  enabled?: boolean;
+  error?: string;
+  roll_deg?: number;
+  pitch_deg?: number;
+  delta_roll_deg?: number;
+  delta_pitch_deg?: number;
 }
 
 export function acquisitionPath(path: string): string {

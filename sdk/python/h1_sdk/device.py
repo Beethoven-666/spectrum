@@ -185,6 +185,11 @@ class Device:
         """Send ``frame``, wait for the matching response, return validData."""
         to = timeout if timeout is not None else self._default_timeout
         with self._lock:
+            # Discard any residue before issuing a command. Under the lock the
+            # input buffer should be empty here; anything present is stale — most
+            # often a trailing stream frame the device emitted after a 0x04 stop
+            # (PROTOCOL.md §8.2) — and would otherwise corrupt this response read.
+            self._reset_input_buffer()
             self._write_frame(frame)
             deadline = time.monotonic() + to
             while True:
@@ -293,12 +298,16 @@ class Device:
         include_tm30: bool = False,
         max_frames: Optional[int] = None,
         frame_timeout: float = 10.0,
+        stop_drain_s: float = 0.5,
     ) -> Iterator[SpectrumFrame]:
         """Yield ``SpectrumFrame`` objects until the consumer stops iterating.
 
-        Sends CMD 0x33 / 0x35 to start the stream and CMD 0x04 to stop it. The
-        iterator will silently drop up to two trailing frames already in flight
-        when the stop command is sent (PROTOCOL.md §8.2).
+        Sends CMD 0x33 / 0x35 to start the stream and CMD 0x04 to stop it. After
+        the stop it drains trailing frames for up to ``stop_drain_s`` (PROTOCOL.md
+        §8.2: the device may emit 1~2 more frames already in flight). Size this to
+        roughly one exposure period so a slow-exposure trailing frame is consumed
+        before the next command — otherwise it lands in the buffer and corrupts the
+        next response read.
         """
         stream_code = (
             _p.Cmd.START_STREAM_WITH_TM30
@@ -310,6 +319,7 @@ class Device:
             stream_cmd=stream_code,
             max_frames=max_frames,
             frame_timeout=frame_timeout,
+            stop_drain_s=stop_drain_s,
         )
 
     def _stream_iterator(
@@ -318,6 +328,7 @@ class Device:
         stream_cmd: int,
         max_frames: Optional[int],
         frame_timeout: float,
+        stop_drain_s: float = 0.5,
     ) -> Iterator[SpectrumFrame]:
         # Acquire the lock for the whole stream so no other command interleaves.
         self._lock.acquire()
@@ -345,20 +356,27 @@ class Device:
                 if not sent_stop:
                     self._write_frame(_p.cmd_stop_capture())
                     sent_stop = True
-                    # Drain any in-flight frames the device already started
-                    # transmitting (PROTOCOL.md §8.2: 1~2 trailing frames).
-                    drain_deadline = time.monotonic() + 0.5
+                    # Drain in-flight frames the device emits after 0x04
+                    # (PROTOCOL.md §8.2). Wait the full window — a trailing frame
+                    # at a long exposure only starts arriving ~one exposure period
+                    # after the stop, so we must not bail the instant the buffer is
+                    # momentarily empty.
+                    drain_deadline = time.monotonic() + max(stop_drain_s, 0.0)
                     while time.monotonic() < drain_deadline:
                         try:
-                            in_waiting = getattr(self._port, "in_waiting", 0)
+                            in_waiting = getattr(self._port, "in_waiting", 0) or 0
                         except Exception:  # noqa: BLE001 - best-effort drain
                             in_waiting = 0
-                        if in_waiting <= 0:
-                            break
-                        try:
-                            self._port.read(in_waiting)
-                        except Exception:  # noqa: BLE001
-                            break
+                        if in_waiting > 0:
+                            try:
+                                self._port.read(in_waiting)
+                            except Exception:  # noqa: BLE001
+                                break
+                            continue
+                        time.sleep(0.02)
+                # Discard anything that arrived during the drain window so the
+                # next command isn't fed a trailing stream frame.
+                self._reset_input_buffer()
             except Exception:  # noqa: BLE001 - best-effort stop
                 pass
             self._streaming = False
@@ -502,6 +520,7 @@ class AsyncDevice:
         include_tm30: bool = False,
         max_frames: Optional[int] = None,
         frame_timeout: float = 10.0,
+        stop_drain_s: float = 0.5,
     ) -> AsyncIterator[SpectrumFrame]:
         """Async generator that mirrors :meth:`Device.stream`.
 
@@ -513,6 +532,7 @@ class AsyncDevice:
             include_tm30=include_tm30,
             max_frames=max_frames,
             frame_timeout=frame_timeout,
+            stop_drain_s=stop_drain_s,
         )
         sentinel = object()
 

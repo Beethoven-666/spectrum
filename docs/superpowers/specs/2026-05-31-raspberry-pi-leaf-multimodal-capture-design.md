@@ -133,21 +133,31 @@ idle
 
 ## 6. H1 自动曝光
 
-H1 默认使用保守自动曝光策略：
+H1 默认使用保守自动曝光策略。**优先使用设备自带的自动曝光**（开发者文档 CMD
+`0x0A=Auto`，配合 `0x13` 设置最大曝光封顶），再用软件做少量校正：
 
-- 最多 2-3 次重试。
+- 先设最大曝光封顶（`0x13`），第 1 帧用设备原生自动曝光，由固件挑曝光时间。
 - 只调整 H1 曝光，不联动 D455 或主 RGB。
 - 每次采集后读取 `exposureStatus`。
-- 如果状态为 `over` 或 `under`，按配置比例缩短或拉长曝光时间后重采。
+- 若原生自动曝光的首帧不是 `normal`（或设备不支持自动），切到手动模式校正：
+  按配置倍率缩短/拉长曝光；一旦同时出现过 `under` 和 `over`（夹住目标），改用两端
+  几何二分，避免来回震荡。
+- 总采集次数受 `max_attempts` 限制（默认 4 = 1 次原生自动 + 至多 3 次手动校正）。
 - 如果最终仍过曝或欠曝，仍保存样本，但质量标记为 `warn` 或 `bad`。
+- 采集会在结束后**恢复操作员在曝光面板里设置的曝光模式**（采集内部固定走手动校正，
+  不会把设备静默留在手动）。
 
 Web UI 提供三个模式：
 
-- `conservative`: 默认模式，有限重试，失败也保存。
+- `conservative`: 默认模式，有限重试，失败也保存（保存选中帧）。
 - `strict`: 没有正常曝光则不保存，除非用户强制覆盖。
-- `multi_exposure`: 保存多档曝光光谱，供离线研究选择。
+- `multi_exposure`: 先按上面的策略找到中心曝光，再围绕它采集一组几何阶梯曝光
+  （`multi_exposure_steps` 档，默认 5：中心 ×{0.25, 0.5, 1, 2, 4}），**保存每一档的完整
+  光谱**，供离线研究选择。
 
-每次尝试都写入 `h1/exposure_attempts.json`，最终选中帧写入 `h1/spectrum.json` 和 `h1/spectrum.csv`。
+每次尝试都写入 `h1/exposure_attempts.json`，最终选中帧写入 `h1/spectrum.json` 和
+`h1/spectrum.csv`。`multi_exposure` 模式额外写 `h1/exposures.json`（各档摘要）和
+`h1/exposures/attempt_NN.csv`（各档光谱）。
 
 ## 7. D455 配置
 
@@ -218,7 +228,10 @@ data/samples/
     ├── h1/
     │   ├── spectrum.json
     │   ├── spectrum.csv
-    │   └── exposure_attempts.json
+    │   ├── exposure_attempts.json
+    │   ├── exposures.json          # 仅 multi_exposure：各档曝光摘要
+    │   └── exposures/              # 仅 multi_exposure：各档完整光谱
+    │       └── attempt_NN.csv
     ├── d455/
     │   ├── color.jpg
     │   ├── depth.png

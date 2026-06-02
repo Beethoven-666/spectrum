@@ -58,6 +58,19 @@ def test_api_mock_capture_roundtrip(tmp_path: Path) -> None:
     blocked = client.get(f"/samples/{sample_id}/files/metadata.json")
     assert blocked.status_code == 404
 
+    d455_frame = client.get("/preview/d455/frame")
+    assert d455_frame.status_code == 200
+    assert d455_frame.headers["content-type"] == "image/jpeg"
+
+    d455_depth = client.get("/preview/d455/depth")
+    assert d455_depth.status_code == 200
+    assert d455_depth.headers["content-type"] == "image/png"
+
+    d455_imu = client.get("/preview/d455/imu")
+    assert d455_imu.status_code == 200
+    assert d455_imu.json()["available"] is True
+    assert "roll_deg" in d455_imu.json()
+
     missing = client.get("/samples/not-a-sample/files/d455/color.jpg")
     assert missing.status_code == 404
 
@@ -139,6 +152,40 @@ def test_config_and_calibration_affect_next_sample(tmp_path: Path) -> None:
     detail = client.get(f"/samples/{sample_id}").json()
     assert detail["metadata"]["roi"]["source"] == "manual"
     assert detail["metadata"]["calibration"]["version"] == "bench-v1"
+
+
+def test_device_profile_change_hot_applies(tmp_path: Path) -> None:
+    app = create_app(default_config(tmp_path / "data"))
+    client = TestClient(app)
+
+    # Camera profile changes now rebuild the workers in place, so they no longer
+    # require a restart (the previous behaviour reported restart_required=True
+    # but never actually applied).
+    res = client.put(
+        "/config",
+        json={"d455_profile": {"color_fps": 5}, "main_rgb_profile": {"mode": "single_shot"}},
+    )
+    assert res.status_code == 200
+    assert res.json()["restart_required"] is False
+    assert client.get("/config").json()["d455_profile"]["color_fps"] == 5
+
+    # h1_port still needs a restart (serial reconnect is out of scope for hot-apply).
+    res2 = client.put("/config", json={"h1_port": "/dev/serial/by-id/usb-other"})
+    assert res2.json()["restart_required"] is True
+
+
+def test_devices_report_camera_health(tmp_path: Path) -> None:
+    app = create_app(default_config(tmp_path / "data"))
+    client = TestClient(app)
+
+    devices = client.get("/devices").json()
+    for key in ("d455", "main_rgb"):
+        assert "health" in devices[key], key
+        assert "reconnecting" in devices[key]["health"], key
+
+    # Mock D455 always serves a cached frame; the null main RGB has no image yet.
+    assert client.get("/preview/d455/frame").status_code == 200
+    assert client.get("/preview/main_rgb/frame").status_code == 503
 
 
 def test_low_disk_blocks_capture(tmp_path: Path) -> None:

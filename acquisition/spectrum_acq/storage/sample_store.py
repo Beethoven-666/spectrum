@@ -210,7 +210,8 @@ class SampleStore:
         }
         _write_json(root / "h1" / "spectrum.json", spectrum)
         _write_json(root / "h1" / "exposure_attempts.json", [to_jsonable(a) for a in h1.attempts])
-        _write_spectrum_csv(root / "h1" / "spectrum.csv", h1)
+        _write_spectrum_csv(root / "h1" / "spectrum.csv", h1.wavelengths, h1.raw_spectrum, h1.actual_spectrum)
+        _write_exposure_frames(root / "h1", h1)
 
         _save_rgb(root / "d455" / "color.jpg", d455.color_rgb)
         Image.fromarray(d455.depth_mm.astype(np.uint16)).save(root / "d455" / "depth.png")
@@ -240,11 +241,41 @@ def _write_json(path: Path, payload: Any) -> None:
         f.write("\n")
 
 
-def _write_spectrum_csv(path: Path, h1: H1Capture) -> None:
+def _write_spectrum_csv(
+    path: Path, wavelengths: list[int], raw: list[int], actual: list[float]
+) -> None:
     with path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["wavelength_nm", "raw", "actual"])
-        writer.writerows(zip(h1.wavelengths, h1.raw_spectrum, h1.actual_spectrum))
+        writer.writerows(zip(wavelengths, raw, actual))
+
+
+def _write_exposure_frames(h1_dir: Path, h1: H1Capture) -> None:
+    """Persist every exposure level for offline study (multi_exposure mode).
+
+    No-op for the other modes, which only keep the selected ``spectrum.{json,csv}``.
+    """
+    if not h1.frames:
+        return
+    exposures_dir = h1_dir / "exposures"
+    exposures_dir.mkdir(parents=True, exist_ok=True)
+    summary = []
+    for frame in h1.frames:
+        csv_name = f"attempt_{frame.attempt:02d}.csv"
+        _write_spectrum_csv(
+            exposures_dir / csv_name, h1.wavelengths, frame.raw_spectrum, frame.actual_spectrum
+        )
+        summary.append(
+            {
+                "attempt": frame.attempt,
+                "exposure_time_us": frame.exposure_time_us,
+                "exposure_status": frame.exposure_status,
+                "spectrum_coefficient": frame.spectrum_coefficient,
+                "selected": frame.selected,
+                "csv": f"exposures/{csv_name}",
+            }
+        )
+    _write_json(h1_dir / "exposures.json", summary)
 
 
 def _save_rgb(path: Path, image_rgb: np.ndarray) -> None:

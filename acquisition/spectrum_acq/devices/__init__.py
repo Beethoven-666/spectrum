@@ -7,6 +7,7 @@ from .interfaces import (
     H1Status,
     MainRgbCapture,
 )
+from .main_rgb import V4l2MainRgbCamera, create_main_rgb_provider, discover_main_rgb_device
 from .mock import MockD455Camera, MockH1Spectrometer, NullMainRgbProvider
 
 __all__ = [
@@ -18,4 +19,7 @@ __all__ = [
     "MockD455Camera",
     "MockH1Spectrometer",
     "NullMainRgbProvider",
+    "V4l2MainRgbCamera",
+    "create_main_rgb_provider",
+    "discover_main_rgb_device",
 ]

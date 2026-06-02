@@ -25,7 +25,9 @@ import { Separator } from '@/components/ui/separator';
 import { Switch } from '@/components/ui/switch';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Textarea } from '@/components/ui/textarea';
+import { D455AttitudeIndicator } from '@/components/acquisition/d455-attitude-indicator';
 import { SamplePreviewSheet } from '@/components/acquisition/sample-preview-sheet';
+import { SpectrometerLivePanel } from '@/components/acquisition/spectrometer-live-panel';
 import {
   acquisitionPath,
   type AcquisitionConfig,
@@ -34,8 +36,10 @@ import {
   type AcquisitionSample,
   type CalibrationSaveResponse,
   type CalibrationStatus,
+  type CameraHealth,
   type CaptureResponse,
   type CaptureStatePayload,
+  type D455ImuPayload,
   type ExposureMode,
   type ExportResponse,
   type RoiConfig,
@@ -62,6 +66,7 @@ type ConfigDraft = {
   maxExposureUs: string;
   underMultiplier: string;
   overMultiplier: string;
+  multiExposureSteps: string;
   minDepthValidRatio: string;
   distanceMinMm: string;
   distanceMaxMm: string;
@@ -79,6 +84,7 @@ export default function AcquisitionPage(): React.ReactElement {
   const [savingConfig, setSavingConfig] = useState(false);
   const [savingCalibration, setSavingCalibration] = useState(false);
   const [previewVersion, setPreviewVersion] = useState(0);
+  const [documentVisible, setDocumentVisible] = useState(true);
   const [selectedSampleId, setSelectedSampleId] = useState<string | null>(null);
   const [exportQuality, setExportQuality] = useState<'all' | 'good' | 'warn' | 'bad'>('all');
   const [roiDraft, setRoiDraft] = useState<RoiDraft>({
@@ -124,6 +130,36 @@ export default function AcquisitionPage(): React.ReactElement {
     acquisitionPath('/calibration'),
     fetcher,
   );
+  // Pause all preview polling while a capture is running (give the USB bus to
+  // the sample) and while the tab is hidden (let demand decay so the cameras
+  // idle-close and release the bus).
+  const captureInProgress =
+    capturing ||
+    captureState.state === 'capture_requested' ||
+    captureState.state === 'capturing' ||
+    captureState.state === 'writing';
+  const previewsActive = health?.ok === true && !captureInProgress && documentVisible;
+
+  const { data: d455Imu } = useSWR<D455ImuPayload>(
+    health?.ok ? acquisitionPath('/preview/d455/imu') : null,
+    fetcher,
+    { refreshInterval: previewsActive ? REFRESH_MS : 0 },
+  );
+
+  useEffect(() => {
+    const onVisibility = (): void => setDocumentVisible(document.visibilityState === 'visible');
+    onVisibility();
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => document.removeEventListener('visibilitychange', onVisibility);
+  }, []);
+
+  useEffect(() => {
+    if (!previewsActive) return;
+    const timer = setInterval(() => {
+      setPreviewVersion((current) => current + 1);
+    }, REFRESH_MS);
+    return () => clearInterval(timer);
+  }, [previewsActive]);
 
   useEffect(() => {
     const events = new EventSource(acquisitionPath('/events'));
@@ -294,14 +330,20 @@ export default function AcquisitionPage(): React.ReactElement {
           <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_420px]">
             <Card>
               <CardHeader>
-                <CardTitle className="text-base">D455 RGB / Depth</CardTitle>
+                <CardTitle className="text-base">D455 RGB / Depth / IMU</CardTitle>
               </CardHeader>
-              <CardContent>
+              <CardContent className="space-y-4">
                 {health?.ok ? (
-                  <div className="grid gap-3 md:grid-cols-2">
-                    <PreviewImage src={previewUrl} alt="D455 RGB preview" label="RGB" />
-                    <PreviewImage src={depthPreviewUrl} alt="D455 depth preview" label="Depth" />
-                  </div>
+                  <>
+                    <div className="grid gap-3 md:grid-cols-2">
+                      <PreviewImage src={previewUrl} alt="D455 RGB preview" label="RGB" />
+                      <PreviewImage src={depthPreviewUrl} alt="D455 depth preview" label="Depth" />
+                    </div>
+                    <D455AttitudeIndicator
+                      imu={d455Imu}
+                      maxDeltaDeg={config?.quality.max_imu_delta_deg ?? 8}
+                    />
+                  </>
                 ) : (
                   <div className="flex aspect-video items-center justify-center rounded-md border bg-muted text-sm text-muted-foreground">
                     等待采集服务
@@ -316,8 +358,8 @@ export default function AcquisitionPage(): React.ReactElement {
               </CardHeader>
               <CardContent className="space-y-4">
                 <DeviceRow name="H1 光谱仪" status={devices?.h1?.status} detail={devices?.h1?.wavelength_range ? `${devices.h1.wavelength_range.start}-${devices.h1.wavelength_range.end} nm` : devices?.h1?.detail?.error} />
-                <DeviceRow name="RealSense D455" status={devices?.d455?.status} detail={devices?.d455?.serial ?? devices?.d455?.name} />
-                <DeviceRow name="主 RGB" status={devices?.main_rgb?.status} detail="missing" />
+                <DeviceRow name="RealSense D455" status={devices?.d455?.status} detail={devices?.d455?.serial ?? devices?.d455?.name} health={devices?.d455?.health} />
+                <DeviceRow name="主 RGB" status={devices?.main_rgb?.status} detail={mainRgbDetail(devices?.main_rgb)} health={devices?.main_rgb?.health} />
                 <Separator />
                 <div className="space-y-1 text-sm">
                   <KeyValue label="数据目录" value={storage?.data_dir ?? '-'} />
@@ -329,6 +371,15 @@ export default function AcquisitionPage(): React.ReactElement {
               </CardContent>
             </Card>
           </div>
+
+          <SpectrometerLivePanel
+            serviceOk={health?.ok === true}
+            h1Ready={devices?.h1?.status === 'ready'}
+            mainRgbStatus={devices?.main_rgb?.status}
+            mainRgbDetail={mainRgbDetail(devices?.main_rgb)}
+            previewVersion={previewVersion}
+            disabled={captureInProgress}
+          />
 
           <Card>
             <CardHeader>
@@ -432,6 +483,7 @@ export default function AcquisitionPage(): React.ReactElement {
                   <NumberField label="Max exposure us" value={activeConfigDraft.maxExposureUs} onChange={(value) => setConfigDraft({ ...activeConfigDraft, maxExposureUs: value })} />
                   <NumberField label="Under multiplier" value={activeConfigDraft.underMultiplier} onChange={(value) => setConfigDraft({ ...activeConfigDraft, underMultiplier: value })} step="0.1" />
                   <NumberField label="Over multiplier" value={activeConfigDraft.overMultiplier} onChange={(value) => setConfigDraft({ ...activeConfigDraft, overMultiplier: value })} step="0.1" />
+                  <NumberField label="Multi-exposure steps" value={activeConfigDraft.multiExposureSteps} onChange={(value) => setConfigDraft({ ...activeConfigDraft, multiExposureSteps: value })} />
                 </CardContent>
               </Card>
 
@@ -544,18 +596,25 @@ function DeviceRow({
   name,
   status,
   detail,
+  health,
 }: {
   name: string;
   status?: string;
   detail?: unknown;
+  health?: CameraHealth;
 }): React.ReactElement {
+  const reconnecting = health?.reconnecting === true;
+  const detailText = reconnecting && health?.last_error ? health.last_error : detail ? String(detail) : '-';
   return (
     <div className="flex items-center justify-between gap-3">
       <div className="min-w-0">
         <div className="text-sm font-medium">{name}</div>
-        <div className="truncate text-xs text-muted-foreground">{detail ? String(detail) : '-'}</div>
+        <div className="truncate text-xs text-muted-foreground">{detailText}</div>
       </div>
-      <QualityBadge status={statusToQuality(status)} />
+      <div className="flex shrink-0 items-center gap-2">
+        {reconnecting ? <Badge variant="secondary">重连中</Badge> : null}
+        <QualityBadge status={statusToQuality(status)} />
+      </div>
     </div>
   );
 }
@@ -686,6 +745,17 @@ function statusToQuality(status?: string): 'good' | 'warn' | 'bad' {
   return 'bad';
 }
 
+function mainRgbDetail(device?: AcquisitionDevices['main_rgb']): string {
+  if (!device) return '-';
+  if (device.status === 'ready') return device.serial ?? device.name ?? '已连接';
+  const detail = device.detail;
+  if (detail && typeof detail === 'object') {
+    const reason = 'reason' in detail ? detail.reason : 'error' in detail ? detail.error : null;
+    if (typeof reason === 'string' && reason.length > 0) return reason;
+  }
+  return device.status === 'missing' ? '待接入' : String(device.status);
+}
+
 function roiFromDraft(roi: RoiDraft): RoiConfig {
   return {
     x: numberValue(roi.x, 0.35),
@@ -712,6 +782,7 @@ function configToDraft(config: AcquisitionConfig): ConfigDraft {
     maxExposureUs: String(config.h1_auto_exposure.max_exposure_us),
     underMultiplier: String(config.h1_auto_exposure.under_multiplier),
     overMultiplier: String(config.h1_auto_exposure.over_multiplier),
+    multiExposureSteps: String(config.h1_auto_exposure.multi_exposure_steps),
     minDepthValidRatio: String(config.quality.min_depth_valid_ratio),
     distanceMinMm: String(config.quality.recommended_distance_min_mm),
     distanceMaxMm: String(config.quality.recommended_distance_max_mm),
@@ -737,12 +808,13 @@ function draftToConfig(draft: ConfigDraft): Partial<AcquisitionConfig> {
     },
     h1_auto_exposure: {
       mode: draft.h1Mode,
-      max_attempts: intValue(draft.maxAttempts, 8),
+      max_attempts: intValue(draft.maxAttempts, 4),
       initial_exposure_us: intValue(draft.initialExposureUs, 50000),
       min_exposure_us: intValue(draft.minExposureUs, 500),
       max_exposure_us: intValue(draft.maxExposureUs, 5000000),
       under_multiplier: numberValue(draft.underMultiplier, 1.7),
       over_multiplier: numberValue(draft.overMultiplier, 0.55),
+      multi_exposure_steps: intValue(draft.multiExposureSteps, 5),
     },
     quality: {
       min_depth_valid_ratio: numberValue(draft.minDepthValidRatio, 0.5),

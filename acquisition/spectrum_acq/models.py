@@ -61,10 +61,36 @@ class Roi:
 class D455Profile:
     color_width: int = 640
     color_height: int = 480
-    color_fps: int = 15
+    color_fps: int = 6
     depth_width: int = 640
     depth_height: int = 480
-    depth_fps: int = 15
+    depth_fps: int = 6
+    enable_imu: bool = True
+    preview_fps: float = 6.0
+
+
+@dataclass(frozen=True)
+class MainRgbProfile:
+    device_path: str | None = None
+    width: int = 640
+    height: int = 480
+    pixel_format: str = "MJPG"
+    timeout_s: float = 10.0
+    mode: str = "persistent"
+    preview_fps: float = 4.0
+
+
+@dataclass(frozen=True)
+class StreamingConfig:
+    """Tuning for the background camera owner threads (hardware mode only)."""
+
+    idle_timeout_s: float = 15.0
+    backoff_min_s: float = 0.5
+    backoff_max_s: float = 30.0
+    max_frame_age_s: float = 2.0
+    d455_get_fresh_timeout_s: float = 8.0
+    main_rgb_get_fresh_timeout_s: float = 12.0
+    reopen_attempts_before_hw_reset: int = 5
 
 
 @dataclass(frozen=True)
@@ -77,12 +103,21 @@ class DiskThresholds:
 @dataclass(frozen=True)
 class H1AutoExposureConfig:
     mode: ExposureModeName = "conservative"
-    max_attempts: int = 8
+    # Design §6 calls for a conservative strategy ("最多 2-3 次重试"). With the
+    # device's native auto-exposure landing attempt #1 close to correct, a small
+    # budget (1 native + up to 3 manual refinements) is plenty.
+    max_attempts: int = 4
     under_multiplier: float = 1.7
     over_multiplier: float = 0.55
     min_exposure_us: int = 500
     max_exposure_us: int = 5_000_000
     initial_exposure_us: int = 50_000
+    # Number of exposure levels captured (and saved) in ``multi_exposure`` mode.
+    multi_exposure_steps: int = 5
+    # Exposure cap for the LIVE stream only (uses the device's native auto-exposure
+    # per frame). Kept well below ``max_exposure_us`` so the preview stays
+    # responsive — a 5 s sample exposure would mean ~12 s per preview frame.
+    stream_max_exposure_us: int = 1_000_000
 
 
 @dataclass(frozen=True)
@@ -105,6 +140,8 @@ class AcquisitionConfig:
     h1_auto_exposure: H1AutoExposureConfig = field(default_factory=H1AutoExposureConfig)
     quality: QualityThresholds = field(default_factory=QualityThresholds)
     h1_port: str = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
+    main_rgb_profile: MainRgbProfile = field(default_factory=MainRgbProfile)
+    streaming: StreamingConfig = field(default_factory=StreamingConfig)
     calibration_path: Path | None = None
 
 

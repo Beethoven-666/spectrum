@@ -1,6 +1,9 @@
 # macOS
 .DS_Store
 
+# Editor / codex backups
+.codex-backups/
+
 # C++
 sdk/cpp/build/
 sdk/cpp/build-*/

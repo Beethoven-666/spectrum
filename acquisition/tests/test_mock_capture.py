@@ -6,9 +6,13 @@ from pathlib import Path
 import pytest
 
 from spectrum_acq.capture import create_mock_coordinator
-from spectrum_acq.capture.coordinator import CaptureCoordinator
+from spectrum_acq.capture.coordinator import (
+    CaptureCoordinator,
+    build_d455_stream,
+    build_main_rgb_stream,
+)
 from spectrum_acq.config import default_config
-from spectrum_acq.devices.mock import MockD455Camera, MockH1Spectrometer, NullMainRgbProvider
+from spectrum_acq.devices.mock import MockH1Spectrometer
 from spectrum_acq.models import H1AutoExposureConfig, QualityStatus
 from spectrum_acq.storage import SampleStore
 
@@ -77,6 +81,37 @@ def test_sqlite_index_rebuilds_from_sample_directories(tmp_path: Path) -> None:
     assert coordinator.store.get_sample(result.sample_id)["id"] == result.sample_id
 
 
+def test_multi_exposure_mode_saves_every_exposure_level(tmp_path: Path) -> None:
+    base = default_config(tmp_path / "data")
+    config = type(base)(
+        **{
+            **base.__dict__,
+            "h1_auto_exposure": H1AutoExposureConfig(
+                mode="multi_exposure", multi_exposure_steps=5
+            ),
+        }
+    )
+    coordinator = CaptureCoordinator(
+        config=config,
+        h1=MockH1Spectrometer(scenario="normal"),
+        d455=build_d455_stream(config),
+        main_rgb=build_main_rgb_stream(config),
+        store=SampleStore(config),
+    )
+
+    result = coordinator.capture()
+    sample_path = Path(result.sample_path)
+
+    # Selected frame still lands in the canonical spot for downstream consumers.
+    assert (sample_path / "h1" / "spectrum.json").exists()
+    # multi_exposure persists each ladder rung for offline study.
+    summary = json.loads((sample_path / "h1" / "exposures.json").read_text())
+    assert len(summary) == 5
+    assert sum(1 for row in summary if row["selected"]) == 1
+    for row in summary:
+        assert (sample_path / "h1" / row["csv"]).exists()
+
+
 def test_strict_h1_exposure_failure_does_not_index_sample(tmp_path: Path) -> None:
     base = default_config(tmp_path / "data")
     config = type(base)(
@@ -88,8 +123,8 @@ def test_strict_h1_exposure_failure_does_not_index_sample(tmp_path: Path) -> Non
     coordinator = CaptureCoordinator(
         config=config,
         h1=MockH1Spectrometer(scenario="always_under"),
-        d455=MockD455Camera(),
-        main_rgb=NullMainRgbProvider(),
+        d455=build_d455_stream(config),
+        main_rgb=build_main_rgb_stream(config),
         store=SampleStore(config),
     )
 

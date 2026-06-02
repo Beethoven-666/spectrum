@@ -4,17 +4,18 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import asdict
 from typing import Any, Iterator
 
 import numpy as np
 
 from spectrum_acq.models import DeviceStatus, H1AutoExposureConfig, utc_now_iso
 
+from .h1 import ladder_factors, select_index
 from .interfaces import (
     D455Snapshot,
     H1Capture,
     H1ExposureAttempt,
+    H1ExposureFrame,
     H1Status,
     MainRgbCapture,
 )
@@ -46,57 +47,93 @@ class MockH1Spectrometer:
         )
 
     def capture_auto(self, config: H1AutoExposureConfig) -> H1Capture:
-        attempts: list[H1ExposureAttempt] = []
-        exposure_us = config.initial_exposure_us
-        statuses = self._status_sequence(config.max_attempts)
-        selected_index = 0
-
-        for idx, exposure_status in enumerate(statuses, start=1):
-            started = utc_now_iso()
-            t0 = time.monotonic()
-            time.sleep(0.001)
-            ended = utc_now_iso()
-            attempt = H1ExposureAttempt(
-                attempt=idx,
-                exposure_time_us=int(exposure_us),
-                exposure_status=exposure_status,
-                started_at=started,
-                ended_at=ended,
-                duration_ms=(time.monotonic() - t0) * 1000.0,
+        multi = config.mode == "multi_exposure"
+        if multi:
+            records = self._multi_exposure_records(config)
+            center_us = self._clamp(config.initial_exposure_us, config)
+            selected_index = select_index(
+                [s for _, s in records],
+                center_us=center_us,
+                exposure_times=[e for e, _ in records],
             )
-            attempts.append(attempt)
-            selected_index = idx - 1
-            if exposure_status == "normal":
-                break
-            if config.mode == "multi_exposure":
-                exposure_us = min(int(exposure_us * config.under_multiplier), config.max_exposure_us)
-                continue
-            if exposure_status == "under":
-                exposure_us = min(int(exposure_us * config.under_multiplier), config.max_exposure_us)
-            elif exposure_status == "over":
-                exposure_us = max(int(exposure_us * config.over_multiplier), config.min_exposure_us)
+        else:
+            records = self._converge_records(config)
+            selected_index = select_index([s for _, s in records])
+
+        wavelengths = list(range(self.wavelength_start, self.wavelength_end + 1))
+        coeff = 2
+        now = utc_now_iso()
+        attempts: list[H1ExposureAttempt] = []
+        frames: list[H1ExposureFrame] = []
+        for i, (exposure_us, status) in enumerate(records):
+            time.sleep(0.001)
+            attempts.append(
+                H1ExposureAttempt(
+                    attempt=i + 1,
+                    exposure_time_us=int(exposure_us),
+                    exposure_status=status,
+                    started_at=now,
+                    ended_at=utc_now_iso(),
+                    duration_ms=1.0,
+                    selected=i == selected_index,
+                )
+            )
+            if multi:
+                raw_i = self._spectrum(wavelengths, exposure_us)
+                frames.append(
+                    H1ExposureFrame(
+                        attempt=i + 1,
+                        exposure_time_us=int(exposure_us),
+                        exposure_status=status,
+                        spectrum_coefficient=coeff,
+                        raw_spectrum=raw_i,
+                        actual_spectrum=[v / (10.0**coeff) for v in raw_i],
+                        selected=i == selected_index,
+                    )
+                )
 
         selected = attempts[selected_index]
-        marked_attempts = [
-            H1ExposureAttempt(**{**asdict(a), "selected": i == selected_index})
-            for i, a in enumerate(attempts)
-        ]
-        self._last_exposure_us = marked_attempts[selected_index].exposure_time_us
-        wavelengths = list(range(self.wavelength_start, self.wavelength_end + 1))
-        raw = self._spectrum(wavelengths, marked_attempts[selected_index].exposure_time_us)
-        coeff = 2
+        self._last_exposure_us = selected.exposure_time_us
+        raw = self._spectrum(wavelengths, selected.exposure_time_us)
         actual = [v / (10.0**coeff) for v in raw]
         return H1Capture(
             status=self.status(),
-            selected_attempt=marked_attempts[selected_index],
-            attempts=marked_attempts,
+            selected_attempt=selected,
+            attempts=attempts,
             wavelengths=wavelengths,
             raw_spectrum=raw,
             actual_spectrum=actual,
             photometric={"CCT": 5100.0, "lux": 8200.0, "Ra": 91.5},
             plant={"PAR": 402.0, "PPFD": 162.0, "YPFD": 131.0},
             spectrum_coefficient=coeff,
+            frames=frames,
         )
+
+    @staticmethod
+    def _clamp(value: float, config: H1AutoExposureConfig) -> int:
+        return max(config.min_exposure_us, min(int(value), config.max_exposure_us))
+
+    def _converge_records(self, config: H1AutoExposureConfig) -> list[tuple[int, str]]:
+        records: list[tuple[int, str]] = []
+        exposure_us: float = config.initial_exposure_us
+        for status in self._status_sequence(config.max_attempts):
+            records.append((self._clamp(exposure_us, config), status))
+            if status == "normal":
+                break
+            if status == "under":
+                exposure_us *= config.under_multiplier
+            elif status == "over":
+                exposure_us *= config.over_multiplier
+        return records
+
+    def _multi_exposure_records(self, config: H1AutoExposureConfig) -> list[tuple[int, str]]:
+        records: list[tuple[int, str]] = []
+        for factor in ladder_factors(config.multi_exposure_steps):
+            exposure_us = self._clamp(round(config.initial_exposure_us * factor), config)
+            status = "normal" if factor == 1.0 else ("under" if factor < 1.0 else "over")
+            records.append((exposure_us, status))
+        records.sort(key=lambda item: item[0])
+        return records
 
     def stream(
         self,

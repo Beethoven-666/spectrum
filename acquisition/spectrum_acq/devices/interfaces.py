@@ -35,6 +35,24 @@ class H1ExposureAttempt:
 
 
 @dataclass(frozen=True)
+class H1ExposureFrame:
+    """Full spectrum for one exposure attempt.
+
+    Only populated in ``multi_exposure`` mode, where every exposure level is
+    saved for offline study (design §6). In the other modes the capture only
+    keeps the selected frame's spectrum on :class:`H1Capture` directly.
+    """
+
+    attempt: int
+    exposure_time_us: int
+    exposure_status: str
+    spectrum_coefficient: int
+    raw_spectrum: list[int]
+    actual_spectrum: list[float]
+    selected: bool = False
+
+
+@dataclass(frozen=True)
 class H1Capture:
     status: H1Status
     selected_attempt: H1ExposureAttempt
@@ -45,6 +63,8 @@ class H1Capture:
     photometric: dict[str, float]
     plant: dict[str, float]
     spectrum_coefficient: int
+    # Per-exposure spectra, populated only in ``multi_exposure`` mode.
+    frames: list[H1ExposureFrame] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -121,3 +141,24 @@ class MainRgbProvider(Protocol):
     def status(self) -> dict[str, Any]: ...
 
     def capture(self) -> MainRgbCapture: ...
+
+
+class CameraStream(Protocol):
+    """A background-owned camera the coordinator and routes read from.
+
+    Implemented by ``CameraWorker`` (hardware, threaded + self-healing) and
+    ``DirectStream`` (mock, synchronous). ``get_fresh`` returns a frame captured
+    after the call (for sample capture); ``preview`` returns the latest cached
+    frame or ``None`` (for HTTP previews); ``status`` returns the device status
+    merged with a ``health`` sub-dict.
+    """
+
+    def status(self) -> dict[str, Any]: ...
+
+    def get_fresh(self, timeout: float | None = None) -> Any: ...
+
+    def preview(self) -> Any | None: ...
+
+    def note_demand(self) -> None: ...
+
+    def close(self) -> None: ...

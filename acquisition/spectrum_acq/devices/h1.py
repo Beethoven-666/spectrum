@@ -14,7 +14,7 @@ from spectrum_acq.models import DeviceStatus, H1AutoExposureConfig, utc_now_iso
 
 from .h1_cie import cie_mode_from_name, cie_mode_name
 from .h1_serialize import spectrum_frame_to_json
-from .interfaces import H1Capture, H1ExposureAttempt, H1Status
+from .interfaces import H1Capture, H1ExposureAttempt, H1ExposureFrame, H1Status
 
 
 class H1DeviceAdapter:
@@ -187,84 +187,226 @@ class H1DeviceAdapter:
         *,
         status: H1Status | None = None,
     ) -> H1Capture:
-        from h1_sdk.types import ExposureMode
-
         active_status = status or self._status_from_device(dev)
-        attempts: list[H1ExposureAttempt] = []
-        selected_index = 0
-        selected_frame = None
-        effective_config = config
+        # Remember the operator's exposure mode. Sample capture always drives the
+        # device internally (native auto for the first shot, manual for refinement),
+        # but it must not silently leave the device flipped from what the UI set.
+        original_mode = active_status.exposure_mode
+        effective_config = self._apply_device_max_exposure(dev, config)
 
+        pairs: list[tuple[H1ExposureAttempt, Any]] = []
+        selected_index = 0
+        with_frames = config.mode == "multi_exposure"
+        try:
+            if with_frames:
+                pairs, selected_index = self._run_multi_exposure(
+                    dev, effective_config, active_status
+                )
+            else:
+                pairs = self._run_converge(dev, effective_config, active_status)
+                selected_index = select_index([a.exposure_status for a, _ in pairs])
+        finally:
+            self._restore_exposure_mode(dev, original_mode)
+
+        if not pairs:
+            raise RuntimeError("H1 capture did not produce a frame")
+        return self._build_capture(
+            dev, pairs, selected_index, active_status, with_frames=with_frames
+        )
+
+    def _apply_device_max_exposure(
+        self, dev: Any, config: H1AutoExposureConfig
+    ) -> H1AutoExposureConfig:
+        """Push the max-exposure cap (CMD 0x13) and clamp config to the device limit.
+
+        The cap is honoured by the device's native auto-exposure, which attempt #1
+        relies on, so it must be set before capturing.
+        """
         try:
             dev.set_max_exposure_time_us(config.max_exposure_us)
         except Exception:
             pass
         try:
-            device_max_exposure_us = int(dev.get_max_exposure_time_us())
-            if device_max_exposure_us > 0:
-                effective_config = replace(
-                    config,
-                    max_exposure_us=min(config.max_exposure_us, device_max_exposure_us),
+            device_max_us = int(dev.get_max_exposure_time_us())
+            if device_max_us > 0:
+                return replace(
+                    config, max_exposure_us=min(config.max_exposure_us, device_max_us)
                 )
         except Exception:
             pass
+        return config
+
+    def _restore_exposure_mode(self, dev: Any, original_mode: str | None) -> None:
+        from h1_sdk.types import ExposureMode
+
+        target = ExposureMode.Auto if original_mode == "auto" else ExposureMode.Manual
+        try:
+            dev.set_exposure_mode(target)
+        except Exception:
+            pass
+
+    def _capture_at(
+        self, dev: Any, idx: int, *, set_exposure_us: int | None, timeout_hint_us: int
+    ) -> tuple[H1ExposureAttempt, Any]:
+        """Capture one frame.
+
+        ``set_exposure_us=None`` keeps the device's current (auto-chosen) exposure
+        instead of forcing a manual value.
+        """
+        started = utc_now_iso()
+        t0 = time.monotonic()
+        if set_exposure_us is not None:
+            dev.set_exposure_time_us(int(set_exposure_us))
+        frame = dev.capture_single(
+            include_tm30=False,
+            timeout=capture_timeout_s(timeout_hint_us, self.timeout_s),
+        )
+        ended = utc_now_iso()
+        attempt = H1ExposureAttempt(
+            attempt=idx,
+            exposure_time_us=int(frame.exposure_time_us),
+            exposure_status=frame.exposure_status.name.lower(),
+            started_at=started,
+            ended_at=ended,
+            duration_ms=(time.monotonic() - t0) * 1000.0,
+        )
+        return attempt, frame
+
+    def _run_converge(
+        self, dev: Any, config: H1AutoExposureConfig, active_status: H1Status
+    ) -> list[tuple[H1ExposureAttempt, Any]]:
+        """Find a well-exposed frame.
+
+        Attempt #1 uses the device's documented native auto-exposure (CMD
+        0x0A=Auto): the firmware lands close to correct in a single shot. If that
+        frame is not ``normal`` (or auto is unsupported) we refine in manual mode,
+        bracketing the target and bisecting between the under/over bounds so the
+        search converges instead of oscillating on fixed multipliers.
+        """
+        from h1_sdk.types import ExposureMode
+
+        max_attempts = max(config.max_attempts, 1)
+        pairs: list[tuple[H1ExposureAttempt, Any]] = []
+        under_bound: int | None = None  # highest exposure seen UNDER (target is higher)
+        over_bound: int | None = None  # lowest exposure seen OVER (target is lower)
+
+        used_auto = False
+        next_exposure_us: int | None
+        try:
+            dev.set_exposure_mode(ExposureMode.Auto)
+            used_auto = True
+            next_exposure_us = None  # let the device choose
+        except Exception:
+            next_exposure_us = clamp_exposure_us(
+                active_status.exposure_time_us or config.initial_exposure_us, config
+            )
+
+        for idx in range(1, max_attempts + 1):
+            if idx == 2 and used_auto:
+                # Hand off from native auto to deterministic manual refinement.
+                try:
+                    dev.set_exposure_mode(ExposureMode.Manual)
+                except Exception:
+                    pass
+            timeout_hint = (
+                next_exposure_us if next_exposure_us is not None else config.max_exposure_us
+            )
+            attempt, frame = self._capture_at(
+                dev, idx, set_exposure_us=next_exposure_us, timeout_hint_us=timeout_hint
+            )
+            pairs.append((attempt, frame))
+            status = attempt.exposure_status
+            if status == "normal":
+                break
+
+            exposure_us = clamp_exposure_us(attempt.exposure_time_us, config)
+            if status == "under":
+                under_bound = exposure_us if under_bound is None else max(under_bound, exposure_us)
+            elif status == "over":
+                over_bound = exposure_us if over_bound is None else min(over_bound, exposure_us)
+
+            nxt = next_exposure_time_us(
+                exposure_us, status, config, under_bound=under_bound, over_bound=over_bound
+            )
+            if nxt == exposure_us:
+                # Clamped at a limit / bracket collapsed — no better exposure to try.
+                break
+            next_exposure_us = nxt
+
+        return pairs
+
+    def _run_multi_exposure(
+        self, dev: Any, config: H1AutoExposureConfig, active_status: H1Status
+    ) -> tuple[list[tuple[H1ExposureAttempt, Any]], int]:
+        """Capture a ladder of exposures around the auto-chosen centre and keep
+        every spectrum for offline study (design §6 ``multi_exposure``)."""
+        from h1_sdk.types import ExposureMode
+
+        converge = self._run_converge(dev, config, active_status)
+        center_index = select_index([a.exposure_status for a, _ in converge])
+        center_us = converge[center_index][0].exposure_time_us
+
         try:
             dev.set_exposure_mode(ExposureMode.Manual)
         except Exception:
             pass
 
-        exposure_us = clamp_exposure_us(
-            active_status.exposure_time_us or effective_config.initial_exposure_us,
-            effective_config,
-        )
-        max_attempts = max(effective_config.max_attempts, 1)
-
-        for idx in range(1, max_attempts + 1):
-            started = utc_now_iso()
-            t0 = time.monotonic()
-            dev.set_exposure_time_us(int(exposure_us))
-            frame = dev.capture_single(
-                include_tm30=False,
-                timeout=capture_timeout_s(exposure_us, self.timeout_s),
+        captured: dict[int, tuple[H1ExposureAttempt, Any]] = {
+            a.exposure_time_us: (a, f) for a, f in converge
+        }
+        idx = len(converge)
+        for factor in ladder_factors(config.multi_exposure_steps):
+            target = clamp_exposure_us(int(round(center_us * factor)), config)
+            if target in captured:
+                continue
+            idx += 1
+            attempt, frame = self._capture_at(
+                dev, idx, set_exposure_us=target, timeout_hint_us=target
             )
-            ended = utc_now_iso()
-            actual_exposure_us = int(frame.exposure_time_us)
-            exposure_status = frame.exposure_status.name.lower()
-            attempt = H1ExposureAttempt(
-                attempt=idx,
-                exposure_time_us=actual_exposure_us,
-                exposure_status=exposure_status,
-                started_at=started,
-                ended_at=ended,
-                duration_ms=(time.monotonic() - t0) * 1000.0,
-            )
-            attempts.append(attempt)
-            selected_index = idx - 1
-            selected_frame = frame
-            if exposure_status == "normal":
-                break
+            captured[attempt.exposure_time_us] = (attempt, frame)
 
-            next_exposure_us = next_exposure_time_us(
-                actual_exposure_us,
-                exposure_status,
-                effective_config,
-            )
-            if next_exposure_us == exposure_us:
-                break
-            exposure_us = next_exposure_us
+        pairs = sorted(captured.values(), key=lambda p: p[0].exposure_time_us)
+        statuses = [a.exposure_status for a, _ in pairs]
+        exposures = [a.exposure_time_us for a, _ in pairs]
+        selected_index = select_index(statuses, center_us=center_us, exposure_times=exposures)
+        return pairs, selected_index
 
+    def _build_capture(
+        self,
+        dev: Any,
+        pairs: list[tuple[H1ExposureAttempt, Any]],
+        selected_index: int,
+        active_status: H1Status,
+        *,
+        with_frames: bool,
+    ) -> H1Capture:
+        marked_attempts: list[H1ExposureAttempt] = []
+        frames: list[H1ExposureFrame] = []
+        for i, (attempt, frame) in enumerate(pairs):
+            marked = replace(attempt, attempt=i + 1, selected=i == selected_index)
+            marked_attempts.append(marked)
+            if with_frames:
+                frames.append(
+                    H1ExposureFrame(
+                        attempt=i + 1,
+                        exposure_time_us=marked.exposure_time_us,
+                        exposure_status=marked.exposure_status,
+                        spectrum_coefficient=frame.spectrum_coefficient,
+                        raw_spectrum=list(frame.raw_spectrum),
+                        actual_spectrum=list(frame.actual_spectrum),
+                        selected=i == selected_index,
+                    )
+                )
+
+        selected_frame = pairs[selected_index][1]
         try:
-            dev.set_exposure_time_us(int(attempts[selected_index].exposure_time_us))
+            dev.set_exposure_time_us(int(marked_attempts[selected_index].exposure_time_us))
         except Exception:
             pass
 
-        if selected_frame is None:
-            raise RuntimeError("H1 capture did not produce a frame")
-        marked_attempts = [
-            H1ExposureAttempt(**{**asdict(a), "selected": i == selected_index})
-            for i, a in enumerate(attempts)
-        ]
-        wavelength_start = active_status.wavelength_range["start"] if active_status.wavelength_range else 0
+        wavelength_start = (
+            active_status.wavelength_range["start"] if active_status.wavelength_range else 0
+        )
         wavelengths = list(
             range(wavelength_start, wavelength_start + len(selected_frame.raw_spectrum))
         )
@@ -274,12 +416,51 @@ class H1DeviceAdapter:
             selected_attempt=marked_attempts[selected_index],
             attempts=marked_attempts,
             wavelengths=wavelengths,
-            raw_spectrum=selected_frame.raw_spectrum,
-            actual_spectrum=selected_frame.actual_spectrum,
+            raw_spectrum=list(selected_frame.raw_spectrum),
+            actual_spectrum=list(selected_frame.actual_spectrum),
             photometric=asdict(selected_frame.photometric),
             plant=asdict(selected_frame.plant),
             spectrum_coefficient=selected_frame.spectrum_coefficient,
+            frames=frames,
         )
+
+    def _enable_stream_auto_exposure(self, dev: Any, config: H1AutoExposureConfig) -> int:
+        """Put the device in native auto-exposure with a preview-friendly cap.
+
+        For a LIVE stream we let the firmware adjust exposure per frame (CMD
+        0x0A=Auto, capped by 0x13) instead of running a blocking software
+        convergence first — that did several full-exposure captures before the
+        first frame, stalling the stream and holding the device lock for tens of
+        seconds at long exposures. Returns the cap actually applied (µs).
+        """
+        from h1_sdk.types import ExposureMode
+
+        cap_us = max(
+            config.min_exposure_us,
+            min(config.max_exposure_us, config.stream_max_exposure_us),
+        )
+        try:
+            dev.set_max_exposure_time_us(cap_us)
+        except Exception:
+            pass
+        try:
+            device_max_us = int(dev.get_max_exposure_time_us())
+            if device_max_us > 0:
+                cap_us = min(cap_us, device_max_us)
+        except Exception:
+            pass
+        # Pin the current exposure down to the cap BEFORE enabling auto, so the
+        # first streamed frame isn't taken at a stale (possibly multi-second)
+        # manual exposure left over from a previous capture.
+        try:
+            dev.set_exposure_time_us(cap_us)
+        except Exception:
+            pass
+        try:
+            dev.set_exposure_mode(ExposureMode.Auto)
+        except Exception:
+            pass
+        return cap_us
 
     def stream(
         self,
@@ -291,13 +472,19 @@ class H1DeviceAdapter:
         dev = self._ensure_device()
         wavelength_range = dev.get_wavelength_range()
         frame_timeout = self.timeout_s
+        # Default stop-drain covers a trailing frame at the base timeout.
+        stop_drain_s = 1.0
         if config is not None:
-            self._capture_auto_with_device(dev, config)
-            frame_timeout = capture_timeout_s(config.max_exposure_us, self.timeout_s)
+            cap_us = self._enable_stream_auto_exposure(dev, config)
+            frame_timeout = capture_timeout_s(cap_us, self.timeout_s)
+            # A trailing frame starts arriving ~one exposure (cap) after the stop;
+            # drain a little longer than that so it's consumed before the next cmd.
+            stop_drain_s = (cap_us / 1_000_000.0) + 0.4
         for frame in dev.stream(
             include_tm30=include_tm30,
             max_frames=max_frames,
             frame_timeout=frame_timeout,
+            stop_drain_s=stop_drain_s,
         ):
             yield spectrum_frame_to_json(frame, wavelength_range.start)
 
@@ -319,9 +506,55 @@ def next_exposure_time_us(
     exposure_us: int,
     exposure_status: str,
     config: H1AutoExposureConfig,
+    *,
+    under_bound: int | None = None,
+    over_bound: int | None = None,
 ) -> int:
+    # Once the target is bracketed (we have seen both an under and an over
+    # exposure), bisect geometrically between the bounds. This converges in a few
+    # steps instead of oscillating on the fixed under/over multipliers.
+    if under_bound is not None and over_bound is not None and over_bound > under_bound:
+        return clamp_exposure_us(int(round((under_bound * over_bound) ** 0.5)), config)
     if exposure_status == "under":
         return clamp_exposure_us(int(exposure_us * config.under_multiplier), config)
     if exposure_status == "over":
         return clamp_exposure_us(int(exposure_us * config.over_multiplier), config)
     return clamp_exposure_us(exposure_us, config)
+
+
+def ladder_factors(steps: int) -> list[float]:
+    """Symmetric geometric multipliers around 1.0 for the multi-exposure ladder.
+
+    ``steps=5`` -> ``[0.25, 0.5, 1.0, 2.0, 4.0]``; ``steps=1`` -> ``[1.0]``.
+    """
+    steps = max(int(steps), 1)
+    if steps == 1:
+        return [1.0]
+    half = (steps - 1) / 2.0
+    span = 2.0  # +-2 octaves at the ends (x0.25 .. x4)
+    return [2.0 ** (span * (i - half) / half) for i in range(steps)]
+
+
+def select_index(
+    statuses: list[str],
+    *,
+    center_us: int | None = None,
+    exposure_times: list[int] | None = None,
+) -> int:
+    """Pick the frame to keep.
+
+    Prefer the first ``normal`` frame; otherwise the frame nearest the auto-chosen
+    centre (when known, for the multi-exposure ladder); otherwise the last (most
+    refined) attempt.
+    """
+    if not statuses:
+        return 0
+    for i, status in enumerate(statuses):
+        if status == "normal":
+            return i
+    if center_us is not None and exposure_times:
+        return min(
+            range(len(exposure_times)),
+            key=lambda i: abs(exposure_times[i] - center_us),
+        )
+    return len(statuses) - 1

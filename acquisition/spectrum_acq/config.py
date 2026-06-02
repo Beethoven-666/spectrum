@@ -12,8 +12,10 @@ from .models import (
     D455Profile,
     DiskThresholds,
     H1AutoExposureConfig,
+    MainRgbProfile,
     QualityThresholds,
     Roi,
+    StreamingConfig,
     to_jsonable,
 )
 
@@ -61,6 +63,12 @@ def _merge_config(base: AcquisitionConfig, raw: dict[str, Any]) -> AcquisitionCo
         ),
         quality=_merge_dataclass(base.quality, raw.get("quality", {}), QualityThresholds),
         h1_port=str(raw.get("h1_port", base.h1_port)),
+        main_rgb_profile=_merge_dataclass(
+            base.main_rgb_profile,
+            raw.get("main_rgb_profile", {}),
+            MainRgbProfile,
+        ),
+        streaming=_merge_dataclass(base.streaming, raw.get("streaming", {}), StreamingConfig),
         calibration_path=(
             Path(raw["calibration_path"]) if raw.get("calibration_path") else base.calibration_path
         ),

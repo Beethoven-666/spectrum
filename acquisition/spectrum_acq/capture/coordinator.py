@@ -13,8 +13,10 @@ from typing import Any
 
 from spectrum_acq.config import default_config
 from spectrum_acq.devices.h1 import H1DeviceAdapter
-from spectrum_acq.devices.interfaces import H1Spectrometer, MainRgbProvider, RealSenseCamera
+from spectrum_acq.devices.interfaces import CameraStream, H1Spectrometer, MainRgbCapture
+from spectrum_acq.devices.main_rgb import V4l2MainRgbCamera
 from spectrum_acq.devices.mock import MockD455Camera, MockH1Spectrometer, NullMainRgbProvider
+from spectrum_acq.devices.streaming import CameraWorker, DirectStream
 from spectrum_acq.geometry import compute_geometry
 from spectrum_acq.models import (
     AcquisitionConfig,
@@ -36,8 +38,8 @@ class CaptureCoordinator:
         *,
         config: AcquisitionConfig,
         h1: H1Spectrometer,
-        d455: RealSenseCamera,
-        main_rgb: MainRgbProvider,
+        d455: CameraStream,
+        main_rgb: CameraStream,
         store: SampleStore | None = None,
     ) -> None:
         self.config = config
@@ -173,7 +175,7 @@ class CaptureCoordinator:
                 h1_config = type(h1_config)(**{**asdict(h1_config), "mode": exposure_mode})
 
             self._set_state(CaptureState.CAPTURING, sample_id=sample_id)
-            d455_snapshot = self.d455.snapshot()
+            d455_snapshot = self.d455.get_fresh()
             h1_capture = self.h1.capture_auto(h1_config)
             if (
                 h1_config.mode == "strict"
@@ -183,7 +185,7 @@ class CaptureCoordinator:
                 raise RuntimeError(
                     f"H1 strict exposure failed: {h1_capture.selected_attempt.exposure_status}"
                 )
-            main_rgb_capture = self.main_rgb.capture()
+            main_rgb_capture = self._capture_main_rgb()
 
             pointcloud, geometry = compute_geometry(
                 d455_snapshot.depth_mm,
@@ -358,9 +360,104 @@ class CaptureCoordinator:
             "storage": storage_status,
         }
 
+    def _capture_main_rgb(self) -> MainRgbCapture:
+        """Grab a fresh main RGB frame, treating absence/failure as non-fatal.
+
+        The main RGB camera is optional; a missing or wedged camera must warn the
+        sample (via quality) rather than fail the whole capture.
+        """
+        try:
+            return self.main_rgb.get_fresh()
+        except Exception as exc:  # noqa: BLE001 - optional device, degrade gracefully
+            return MainRgbCapture(
+                status=DeviceStatus.MISSING,
+                captured_at=utc_now_iso(),
+                image_rgb=None,
+                metadata={"driver": "v4l2", "reason": str(exc)},
+            )
+
     def _set_state(self, state: CaptureState, **kwargs: Any) -> None:
         self._state = state
         self._current = {"state": state, **kwargs}
+
+    def apply_config(self, next_config: AcquisitionConfig) -> None:
+        """Adopt a new config, rebuilding camera workers whose profile changed.
+
+        Fixes the previous behaviour where a profile change was reported as
+        "restart required" but never actually took effect on the running cameras.
+        """
+        prev = self.config
+        self.config = next_config
+        self.store.config = next_config
+        if next_config.mock or prev.mock:
+            return  # mock<->hardware switch is handled by a service restart
+        streaming_changed = next_config.streaming != prev.streaming
+        if streaming_changed or next_config.d455_profile != prev.d455_profile:
+            old, self.d455 = self.d455, build_d455_stream(next_config)
+            _safe_close(old)
+        if streaming_changed or next_config.main_rgb_profile != prev.main_rgb_profile:
+            old, self.main_rgb = self.main_rgb, build_main_rgb_stream(next_config)
+            _safe_close(old)
+
+    def close(self) -> None:
+        """Release cameras and the H1 serial connection (service shutdown)."""
+        _safe_close(self.d455)
+        _safe_close(self.main_rgb)
+        closer = getattr(self.h1, "close", None) or getattr(self.h1, "_reset_device", None)
+        if callable(closer):
+            try:
+                closer()
+            except Exception:
+                pass
+
+
+def _safe_close(stream: CameraStream) -> None:
+    try:
+        stream.close()
+    except Exception:
+        pass
+
+
+def build_d455_stream(config: AcquisitionConfig) -> CameraStream:
+    """Wrap the D455 device in a synchronous DirectStream (mock) or owner-thread
+    CameraWorker (hardware)."""
+    if config.mock:
+        cam = MockD455Camera()
+        return DirectStream(read=cam.snapshot, status=cam.status)
+    from spectrum_acq.devices.realsense import RealSenseD455Camera
+
+    adapter = RealSenseD455Camera(config.d455_profile)
+    s = config.streaming
+    return CameraWorker(
+        adapter,
+        name="d455",
+        preview_fps=config.d455_profile.preview_fps,
+        idle_timeout_s=s.idle_timeout_s,
+        backoff_min_s=s.backoff_min_s,
+        backoff_max_s=s.backoff_max_s,
+        max_frame_age_s=s.max_frame_age_s,
+        get_fresh_timeout_s=s.d455_get_fresh_timeout_s,
+        reopen_attempts_before_hw_reset=s.reopen_attempts_before_hw_reset,
+    )
+
+
+def build_main_rgb_stream(config: AcquisitionConfig) -> CameraStream:
+    if config.mock:
+        cam = NullMainRgbProvider()
+        return DirectStream(read=cam.capture, status=cam.status)
+    adapter = V4l2MainRgbCamera(config.main_rgb_profile)
+    s = config.streaming
+    return CameraWorker(
+        adapter,
+        name="main_rgb",
+        preview_fps=config.main_rgb_profile.preview_fps,
+        idle_timeout_s=s.idle_timeout_s,
+        backoff_min_s=s.backoff_min_s,
+        backoff_max_s=s.backoff_max_s,
+        max_frame_age_s=s.max_frame_age_s,
+        get_fresh_timeout_s=s.main_rgb_get_fresh_timeout_s,
+        reopen_attempts_before_hw_reset=s.reopen_attempts_before_hw_reset,
+    )
 
 
 def create_mock_coordinator(data_dir: Path | str) -> CaptureCoordinator:
@@ -369,8 +466,8 @@ def create_mock_coordinator(data_dir: Path | str) -> CaptureCoordinator:
     return CaptureCoordinator(
         config=config,
         h1=MockH1Spectrometer(),
-        d455=MockD455Camera(),
-        main_rgb=NullMainRgbProvider(),
+        d455=build_d455_stream(config),
+        main_rgb=build_main_rgb_stream(config),
         store=store,
     )
 
@@ -388,18 +485,11 @@ def max_quality(a: QualityStatus, b: QualityStatus) -> QualityStatus:
 
 def create_default_coordinator(config: AcquisitionConfig) -> CaptureCoordinator:
     store = SampleStore(config)
-    if config.mock:
-        h1: H1Spectrometer = MockH1Spectrometer()
-        d455: RealSenseCamera = MockD455Camera()
-    else:
-        h1 = H1DeviceAdapter(config.h1_port)
-        from spectrum_acq.devices.realsense import RealSenseD455Camera
-
-        d455 = RealSenseD455Camera(config.d455_profile)
+    h1: H1Spectrometer = MockH1Spectrometer() if config.mock else H1DeviceAdapter(config.h1_port)
     return CaptureCoordinator(
         config=config,
         h1=h1,
-        d455=d455,
-        main_rgb=NullMainRgbProvider(),
+        d455=build_d455_stream(config),
+        main_rgb=build_main_rgb_stream(config),
         store=store,
     )
