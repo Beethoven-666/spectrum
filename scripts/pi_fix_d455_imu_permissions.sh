@@ -9,17 +9,32 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
+# Group-own the matching RealSense IIO device tree by "plugdev" and make it
+# group read/write, rather than world-writable (a+rw). The udev MODE/GROUP only
+# applies to the device node itself, so the RUN line recurses group ownership
+# and the group-writable bit over the buffer/scan_elements sub-attributes that
+# libusb/IIO needs, without exposing them to every local user.
 cat >"$RULE" <<'EOF'
 # Intel RealSense D455/D455f IMU via Linux IIO
-SUBSYSTEM=="iio", KERNEL=="iio:device*", ATTRS{idVendor}=="8086", ATTRS{idProduct}=="0b5c", MODE="0660", GROUP="plugdev", TAG+="uaccess", RUN+="/bin/sh -c 'chmod -R a+rw /sys$env{DEVPATH}'"
+SUBSYSTEM=="iio", KERNEL=="iio:device*", ATTRS{idVendor}=="8086", ATTRS{idProduct}=="0b5c", MODE="0660", GROUP="plugdev", TAG+="uaccess", RUN+="/bin/sh -c 'chgrp -R plugdev /sys$env{DEVPATH} && chmod -R g+rw /sys$env{DEVPATH}'"
 EOF
 chmod 644 "$RULE"
 udevadm control --reload-rules
 udevadm trigger --subsystem-match=iio
 
+# Apply the same scoped permissions immediately to the RealSense IIO device(s)
+# already present, so a re-plug/reboot is not required. Match on the USB
+# vendor:product so we never touch unrelated IIO devices on the bus.
 for dev in /sys/bus/iio/devices/iio:device*; do
   [ -e "$dev" ] || continue
-  chmod -R a+rw "$dev"
+  # Resolve the device's USB ids; skip anything that is not the D455 (8086:0b5c).
+  vid="$(cat "$dev"/../../../idVendor 2>/dev/null || true)"
+  pid="$(cat "$dev"/../../../idProduct 2>/dev/null || true)"
+  if [ "$vid" != "8086" ] || [ "$pid" != "0b5c" ]; then
+    continue
+  fi
+  chgrp -R plugdev "$dev"
+  chmod -R g+rw "$dev"
 done
 
 echo "Installed $RULE and refreshed IIO permissions."

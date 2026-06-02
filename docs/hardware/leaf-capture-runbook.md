@@ -122,8 +122,8 @@ A complete v1 sample contains:
 - `roi/preview.jpg`
 - `main_rgb/status.json`
 
-SQLite is only the query index at `~/spectrum/data/index.sqlite3`; the sample
-directory remains the source of truth.
+SQLite is only the query index at `~/spectrum/data/index/samples.sqlite3`; the
+sample directory remains the source of truth.
 
 ## Known hardware notes
 

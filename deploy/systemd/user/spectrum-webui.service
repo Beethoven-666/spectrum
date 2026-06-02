@@ -2,6 +2,11 @@
 Description=Spectrum Web UI
 After=network-online.target spectrum-acq.service
 Wants=network-online.target spectrum-acq.service
+# Bound crash loops: if the unit restarts more than StartLimitBurst times
+# within StartLimitIntervalSec, systemd stops trying instead of looping forever.
+# These keys are parsed from the [Unit] section in modern systemd.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -11,8 +16,11 @@ Environment=ACQUISITION_API_BASE_URL=http://127.0.0.1:8000
 ExecStart=%h/.local/bin/npm run start -w h1-webui -- --hostname 0.0.0.0 --port 3005
 Restart=on-failure
 RestartSec=3
-StandardOutput=append:%h/spectrum/logs/webui.log
-StandardError=append:%h/spectrum/logs/webui.log
+# Log to the journal (journalctl --user -u spectrum-webui) instead of an
+# unbounded append-only file. The journal is size-capped/rotated by systemd,
+# so this avoids the previous unrotated logs/webui.log growth.
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=default.target

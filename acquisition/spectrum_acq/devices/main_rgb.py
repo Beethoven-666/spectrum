@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import io
 import logging
+import select
 import shutil
 import subprocess
 import tempfile
@@ -47,6 +48,45 @@ _SOI = b"\xff\xd8"  # JPEG start-of-image marker
 _EOI = b"\xff\xd9"  # JPEG end-of-image marker
 _READ_CHUNK = 65536
 _MAX_BUF = 4 * 1024 * 1024  # desync guard: never let the reassembly buffer grow unbounded
+
+
+class MainRgbStreamStalled(RuntimeError):
+    """Raised when the persistent stream produced no bytes within the deadline.
+
+    A blocking ``proc.stdout.read`` cannot tell a slow-but-alive stream from a
+    pipe that is open yet permanently silent (e.g. a Pi5 USB brownout that
+    starves the camera). Surfacing this as an exception lets the owning
+    CameraWorker tear the subprocess down and reopen it instead of wedging its
+    owner thread forever.
+    """
+
+
+def _read_stream_chunk(stream: Any, *, timeout_s: float) -> bytes:
+    """Read up to ``_READ_CHUNK`` bytes from ``stream`` within ``timeout_s``.
+
+    Uses ``select.select`` to bound the wait when the stream exposes a real OS
+    file descriptor (the live ``v4l2-ctl`` pipe). If the deadline passes with no
+    data readable, raises :class:`MainRgbStreamStalled` so the worker self-heals.
+
+    Streams without a usable ``fileno()`` (e.g. test fakes, in-memory buffers)
+    fall back to a plain blocking ``read`` and are never subjected to ``select``;
+    this keeps existing behaviour and unit tests intact.
+    """
+    fd: int | None = None
+    fileno = getattr(stream, "fileno", None)
+    if callable(fileno):
+        try:
+            fd = fileno()
+        except (OSError, ValueError):
+            fd = None  # not backed by a real fd (e.g. wrapped buffer): blocking read
+    if fd is not None and fd >= 0:
+        # select() returns the empty list on timeout; a stall therefore raises.
+        readable, _, _ = select.select([fd], [], [], max(float(timeout_s), 0.0))
+        if not readable:
+            raise MainRgbStreamStalled(
+                f"v4l2-ctl produced no bytes within {timeout_s:.1f}s (USB stall?)"
+            )
+    return stream.read(_READ_CHUNK)
 
 
 def discover_main_rgb_device(
@@ -192,9 +232,14 @@ class V4l2MainRgbCamera:
                         "pixel_format": self.profile.pixel_format,
                     },
                 )
-            chunk = proc.stdout.read(_READ_CHUNK)
+            # Time-bounded read: a silent USB stall leaves the pipe open but
+            # idle, so a bare blocking read would wedge this thread forever. On a
+            # missed deadline _read_stream_chunk raises MainRgbStreamStalled,
+            # which propagates to CameraWorker._step -> _handle_failure, tearing
+            # down and reopening the subprocess (self-heal).
+            chunk = _read_stream_chunk(proc.stdout, timeout_s=self.profile.timeout_s)
             if not chunk:
-                raise RuntimeError("v4l2-ctl stream ended (stdout closed)")
+                raise RuntimeError("v4l2-ctl stream ended (stdout closed)")  # clean EOF
             self._buf += chunk
             if len(self._buf) > _MAX_BUF:
                 last_soi = self._buf.rfind(_SOI)

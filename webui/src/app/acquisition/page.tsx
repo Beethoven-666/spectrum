@@ -162,16 +162,50 @@ export default function AcquisitionPage(): React.ReactElement {
   }, [previewsActive]);
 
   useEffect(() => {
-    const events = new EventSource(acquisitionPath('/events'));
-    events.addEventListener('state', (event) => {
-      try {
-        setCaptureState(JSON.parse((event as MessageEvent).data) as CaptureStatePayload);
-      } catch {
-        setCaptureState({ state: 'error', error: 'invalid event payload' });
-      }
-    });
-    events.onerror = () => setCaptureState((current) => ({ ...current, error: 'event stream disconnected' }));
-    return () => events.close();
+    // Capture-state stream. The native EventSource auto-reconnects (~3s) after
+    // every transport drop and would otherwise pin a sticky "disconnected"
+    // error forever, so we close it ourselves after a few drops and reconnect
+    // with bounded backoff instead of letting the browser storm.
+    const MAX_DROPS = 5;
+    const BACKOFF_MAX_MS = 8000;
+    let es: EventSource | null = null;
+    let closed = false;
+    let drops = 0;
+    let backoffTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const open = (): void => {
+      if (closed) return;
+      es = new EventSource(acquisitionPath('/events'));
+      es.addEventListener('state', (event) => {
+        drops = 0;
+        try {
+          setCaptureState(JSON.parse((event as MessageEvent).data) as CaptureStatePayload);
+        } catch {
+          setCaptureState({ state: 'error', error: 'invalid event payload' });
+        }
+      });
+      es.onerror = () => {
+        if (closed) return;
+        // Suppress the native auto-reconnect; back off and retry a bounded
+        // number of times before giving up so we never reconnect-storm.
+        es?.close();
+        es = null;
+        drops += 1;
+        if (drops >= MAX_DROPS) {
+          setCaptureState((current) => ({ ...current, error: 'event stream disconnected' }));
+          return;
+        }
+        const delay = Math.min(1000 * 2 ** (drops - 1), BACKOFF_MAX_MS);
+        backoffTimer = setTimeout(open, delay);
+      };
+    };
+
+    open();
+    return () => {
+      closed = true;
+      if (backoffTimer) clearTimeout(backoffTimer);
+      es?.close();
+    };
   }, []);
 
   const previewUrl = useMemo(

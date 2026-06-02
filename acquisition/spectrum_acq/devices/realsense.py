@@ -28,6 +28,30 @@ class RealSenseD455Camera:
     #: not sleep-throttle on top of it (that would back up librealsense's queue).
     paces_itself = True
 
+    #: How many consecutive "opened fine but never delivered a frame" sessions
+    #: mark the frames-never-arrive pattern (Pi 5 USB under-voltage: the device
+    #: re-enumerates, ``open`` succeeds, then every ``wait_for_frames`` times
+    #: out). Two in a row is enough to distinguish this from a one-off slow
+    #: start while staying clear of a genuine transient drop (which delivers at
+    #: least one frame before failing).
+    _UNDERVOLTAGE_DRY_OPENS = 2
+
+    #: Once the under-voltage pattern is established, only honour one in this
+    #: many ``hardware_reset`` requests. Re-enumerating the USB bus cannot add
+    #: current, so spamming it (the worker asks every ~5 failed reopens, i.e.
+    #: ~150 s under sustained under-voltage) just churns the bus for nothing.
+    #: A rare reset is still allowed in case the deficit was momentary.
+    _UNDERVOLTAGE_RESET_EVERY = 20
+
+    #: Class-level defaults for the under-voltage tracking state so the methods
+    #: that read it stay safe even on instances built via ``__new__`` (the unit
+    #: tests do this to inject a fake ``rs``); ``__init__`` always sets the real
+    #: per-instance values below.
+    _got_frame_this_session: bool = False
+    _dry_open_streak: int = 0
+    _undervoltage_suspected: bool = False
+    _hw_reset_requests_since_reset: int = 0
+
     def __init__(
         self,
         profile: D455Profile,
@@ -56,6 +80,16 @@ class RealSenseD455Camera:
         self._imu_error: str | None = None
         self._previous_imu_angles: tuple[float, float] | None = None
         self._latest_motion_frames: dict[str, dict[str, Any]] = {}
+
+        # Frames-never-arrive (USB under-voltage) tracking. Set true once the
+        # current pipeline session has produced at least one good frame; reset
+        # on every open(). Sessions that open but never deliver are counted in
+        # _dry_open_streak so describe()/hardware_reset() can recognise the
+        # power-deficit pattern instead of treating it as a transient drop.
+        self._got_frame_this_session = False
+        self._dry_open_streak = 0
+        self._undervoltage_suspected = False
+        self._hw_reset_requests_since_reset = 0
 
     # ------------------------------------------------------------------ adapter
 
@@ -87,6 +121,10 @@ class RealSenseD455Camera:
 
         depth_sensor = self._pipeline_profile.get_device().first_depth_sensor()
         self._depth_scale = depth_sensor.get_depth_scale()
+        # New session: it has not delivered a frame yet. close() inspects this
+        # when the session ends to tell a power-deficit "dry" open (never a
+        # frame) apart from a transient drop (streamed, then hiccuped).
+        self._got_frame_this_session = False
 
     def read(self) -> D455Snapshot:
         pipeline = self.pipeline
@@ -120,6 +158,12 @@ class RealSenseD455Camera:
                 imu["delta_roll_deg"] = 0.0
                 imu["delta_pitch_deg"] = 0.0
             self._previous_imu_angles = (roll_deg, pitch_deg)
+        # A real frame proves the device is powered and streaming, so clear any
+        # under-voltage suspicion and the dry-open streak: the next failure is a
+        # genuine transient drop and should take the normal recovery path.
+        self._got_frame_this_session = True
+        self._dry_open_streak = 0
+        self._undervoltage_suspected = False
         return D455Snapshot(
             status=DeviceStatus.READY,
             color_rgb=color,
@@ -135,6 +179,17 @@ class RealSenseD455Camera:
         """Stop the pipeline. Safe to call from another thread to unblock ``read``."""
         pipeline = self.pipeline
         started = self._pipeline_profile is not None
+        # A session that actually started but never delivered a frame is a "dry"
+        # open: the device enumerated and the pipeline started, yet every
+        # wait_for_frames timed out. Under sustained Pi 5 USB under-voltage this
+        # repeats forever; a streak of them flags the power-deficit pattern so
+        # hardware_reset() stops re-enumerating a bus it cannot give more
+        # current. A session that produced at least one frame is a transient
+        # drop and is deliberately *not* counted (it keeps normal recovery).
+        if started and not self._got_frame_this_session:
+            self._dry_open_streak += 1
+            if self._dry_open_streak >= self._UNDERVOLTAGE_DRY_OPENS:
+                self._undervoltage_suspected = True
         self._pipeline_profile = None
         self._depth_scale = None
         self._latest_motion_frames = {}
@@ -153,6 +208,7 @@ class RealSenseD455Camera:
                 "name": "Intel RealSense D455",
                 "serial": None,
                 "detail": {"error": "no RealSense devices found"},
+                "usb_undervoltage": self._undervoltage_signal(),
             }
         dev = devices[0]
         return {
@@ -161,6 +217,10 @@ class RealSenseD455Camera:
             "serial": _safe_info(self.rs, dev, self.rs.camera_info.serial_number),
             "firmware": _safe_info(self.rs, dev, self.rs.camera_info.firmware_version),
             "imu": {"enabled": bool(self._imu_requested), "error": self._imu_error},
+            # Surfaced as a top-level key (not under "health", which CameraWorker
+            # owns and overwrites) so the frames-never-arrive / power-deficit
+            # pattern is visible in /devices for operators.
+            "usb_undervoltage": self._undervoltage_signal(),
             "profile": {
                 "color_width": self.profile.color_width,
                 "color_height": self.profile.color_height,
@@ -171,8 +231,44 @@ class RealSenseD455Camera:
             },
         }
 
+    def _undervoltage_signal(self) -> dict[str, Any]:
+        """Health hint for the 'opened fine but never streamed a frame' pattern.
+
+        ``suspected`` true means consecutive pipeline sessions started but every
+        frame timed out — the documented Pi 5 USB under-voltage signature, which
+        a USB hardware reset cannot fix. The advice points an operator at the
+        real cause (power budget) instead of a phantom camera fault.
+        """
+        return {
+            "suspected": self._undervoltage_suspected,
+            "dry_open_streak": self._dry_open_streak,
+            "advice": (
+                "device enumerates but never streams frames; likely USB "
+                "under-voltage (check Pi 5 usb_max_current_enable / power "
+                "supply / cable), not a camera fault"
+                if self._undervoltage_suspected
+                else None
+            ),
+        }
+
     def hardware_reset(self) -> None:
-        """Last-resort recovery requested by the worker after repeated failures."""
+        """Last-resort recovery requested by the worker after repeated failures.
+
+        For a genuine transient drop this re-enumerates the device and usually
+        clears the fault. But under sustained USB under-voltage the device opens
+        and then never delivers a frame, and re-enumeration cannot add current —
+        so once that pattern is suspected we honour only one in
+        ``_UNDERVOLTAGE_RESET_EVERY`` requests instead of churning the bus every
+        time the worker asks (~150 s apart). The threshold the worker itself
+        uses is unchanged; we only thin out the resets for this one pattern.
+        """
+        if self._undervoltage_suspected:
+            self._hw_reset_requests_since_reset += 1
+            if self._hw_reset_requests_since_reset < self._UNDERVOLTAGE_RESET_EVERY:
+                # Skip: the bus is power-starved, not wedged. Re-enumerating
+                # would only add USB churn (and another inrush brown-out).
+                return
+            self._hw_reset_requests_since_reset = 0
         try:
             for dev in self.rs.context().query_devices():
                 dev.hardware_reset()

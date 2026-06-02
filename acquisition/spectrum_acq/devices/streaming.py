@@ -155,7 +155,14 @@ class CameraWorker:
         self._buffer = FrameBuffer()
         self._health = FrameHealth()
         self._state_lock = threading.Lock()
+        # _start_lock makes (re)starting and closing the owner thread mutually
+        # exclusive, so a concurrent preview()/get_fresh() can never resurrect a
+        # worker that close() is tearing down (which would leak a thread and
+        # leave the device wedged "busy" with no owner).
         self._start_lock = threading.Lock()
+        # Terminal flag, set under _start_lock by close(). Once True the worker
+        # is permanently retired: _ensure_running() refuses to start a thread.
+        self._closed = False
         self._stop = threading.Event()
         self._paused = False
         self._last_demand = 0.0
@@ -211,7 +218,10 @@ class CameraWorker:
         with self._state_lock:
             base = dict(self._describe)
             health = self._health.as_dict(now=now)
-        health["decode_failures"] = int(getattr(self._adapter, "decode_failures", 0))
+            # Read the adapter's metrics counter under the same lock as the
+            # health fields so the whole snapshot is internally consistent and
+            # well-defined when read concurrently with the owner thread.
+            health["decode_failures"] = int(getattr(self._adapter, "decode_failures", 0))
         base["status"] = self._derive_status(base, health)
         base["health"] = health
         return base
@@ -223,16 +233,23 @@ class CameraWorker:
         self._paused = False
 
     def close(self) -> None:
-        self._stop.set()
-        # Unblock an in-flight read() (pipeline.stop / killing the subprocess).
-        try:
-            self._adapter.close()
-        except Exception:
-            pass
-        thread = self._thread
-        if thread is not None:
-            thread.join(timeout=3.0)
-        self._device_open = False
+        # Hold _start_lock for the whole teardown so it is mutually exclusive
+        # with _ensure_running(): a concurrent preview()/get_fresh() either ran
+        # fully before us (and we join its thread) or sees _closed afterwards
+        # and refuses to start a new one. Either way no worker is resurrected.
+        with self._start_lock:
+            self._closed = True  # terminal: block any future (re)start
+            self._stop.set()
+            # Unblock an in-flight read() (pipeline.stop / killing the subprocess).
+            try:
+                self._adapter.close()
+            except Exception:
+                pass
+            thread = self._thread
+            if thread is not None:
+                thread.join(timeout=3.0)
+            self._thread = None
+            self._device_open = False
         with self._buffer.cond:
             self._buffer.cond.notify_all()
 
@@ -243,6 +260,10 @@ class CameraWorker:
         if thread is not None and thread.is_alive():
             return
         with self._start_lock:
+            # Never resurrect a closed worker. close() sets _closed under the
+            # same lock, so this check cannot race with an in-progress teardown.
+            if self._closed:
+                return
             thread = self._thread
             if thread is not None and thread.is_alive():
                 return

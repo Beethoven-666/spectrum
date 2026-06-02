@@ -2,6 +2,11 @@
 Description=Spectrum acquisition API
 After=network-online.target
 Wants=network-online.target
+# Bound crash loops: if the unit restarts more than StartLimitBurst times
+# within StartLimitIntervalSec, systemd stops trying instead of looping forever.
+# These keys are parsed from the [Unit] section in modern systemd.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -10,8 +15,11 @@ Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=%h/spectrum/acquisition/.venv/bin/spectrum-acq --data-dir ./data --hardware --host 127.0.0.1 --port 8000
 Restart=on-failure
 RestartSec=3
-StandardOutput=append:%h/spectrum/logs/acquisition.log
-StandardError=append:%h/spectrum/logs/acquisition.log
+# Log to the journal (journalctl --user -u spectrum-acq) instead of an
+# unbounded append-only file. The journal is size-capped/rotated by systemd,
+# so this avoids the previous unrotated logs/acquisition.log growth.
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=default.target

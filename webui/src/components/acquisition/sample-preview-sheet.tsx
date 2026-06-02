@@ -228,8 +228,13 @@ function SampleD455Preview({
 function SampleSpectrumPreview({ sampleId }: { sampleId: string }): React.ReactElement {
   const spectrumKey = acquisitionPath(`/samples/${sampleId}/files/h1/spectrum.json`);
   const { data, error, isLoading } = useSWR<SampleSpectrum>(spectrumKey, fetcher);
-  const wavelengths = numberArray(data?.wavelengths);
-  const values = numberArray(data?.actual_spectrum) ?? numberArray(data?.raw_spectrum);
+  // Tolerate the occasional non-finite sample value instead of discarding the
+  // whole stored spectrum: sanitizeSpectrum drops only the offending index-pairs
+  // while keeping wavelengths and values aligned.
+  const spectrum = sanitizeSpectrum(
+    data?.wavelengths,
+    data?.actual_spectrum ?? data?.raw_spectrum,
+  );
   const photometric = recordValue(data?.photometric);
   const selectedAttempt = recordValue(data?.selected_attempt);
 
@@ -244,9 +249,9 @@ function SampleSpectrumPreview({ sampleId }: { sampleId: string }): React.ReactE
         <MetricBox label="CCT" value={formatMaybeNumber(numberValue(photometric?.CCT), ' K', 0)} />
         <MetricBox label="lux" value={formatMaybeNumber(numberValue(photometric?.lux), '', 1)} />
       </div>
-      {wavelengths && values && wavelengths.length === values.length ? (
+      {spectrum ? (
         <div className="rounded-md border p-3">
-          <SpectrumChart wavelengths={wavelengths} values={values} />
+          <SpectrumChart wavelengths={spectrum.wavelengths} values={spectrum.values} />
         </div>
       ) : (
         <EmptyPanel title="该样本没有可绘制光谱" detail="需要 h1/spectrum.json 中同时包含 wavelengths 和 actual_spectrum。" />
@@ -434,10 +439,30 @@ function numberValue(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
-function numberArray(value: unknown): number[] | null {
-  return Array.isArray(value) && value.every((item) => typeof item === 'number' && Number.isFinite(item))
-    ? value
-    : null;
+/**
+ * Build an aligned, plottable spectrum from a stored sample. Both inputs must be
+ * arrays, but individual non-finite values (NaN/Infinity, or non-numbers) are
+ * skipped rather than discarding the whole spectrum; wavelengths and values stay
+ * index-aligned because we only keep pairs where both sides are finite numbers.
+ * Returns null if there is nothing plottable left.
+ */
+function sanitizeSpectrum(
+  rawWavelengths: unknown,
+  rawValues: unknown,
+): { wavelengths: number[]; values: number[] } | null {
+  if (!Array.isArray(rawWavelengths) || !Array.isArray(rawValues)) return null;
+  const wavelengths: number[] = [];
+  const values: number[] = [];
+  const n = Math.min(rawWavelengths.length, rawValues.length);
+  for (let i = 0; i < n; i++) {
+    const w = rawWavelengths[i];
+    const v = rawValues[i];
+    if (typeof w === 'number' && Number.isFinite(w) && typeof v === 'number' && Number.isFinite(v)) {
+      wavelengths.push(w);
+      values.push(v);
+    }
+  }
+  return wavelengths.length > 0 ? { wavelengths, values } : null;
 }
 
 function stringArray(value: unknown): string[] | null {

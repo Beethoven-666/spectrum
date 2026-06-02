@@ -164,8 +164,10 @@ static void cmdCaptureSingle() {
     size_t         count  = (size_t)(wlEnd - wlStart + 1);
     const uint8_t* spec   = vd + 275;
 
-    float scale = 1.0f;
-    for (int i = 0; i < N; ++i) scale *= 0.1f;     // divide by 10^N
+    // actualSpectrum = raw / 10^N (PROTOCOL.md §4.3). N is i16 and may be
+    // negative, so scale = 10^-N. The old loop only multiplied for N>0, giving
+    // scale=1 (and thus wrong values) for N<=0; powf handles negative N too.
+    float scale = powf(10.0f, -(float)N);          // multiply by 10^-N == divide by 10^N
 
     Serial.printf("status=%u exposureUs=%lu N=%d samples=%u\n",
                   status, (unsigned long)expUs, (int)N, (unsigned)count);

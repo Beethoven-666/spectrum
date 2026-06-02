@@ -6,6 +6,7 @@ where only the service skeleton is installed.
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import asdict, replace
 from typing import Any, Iterator
@@ -15,6 +16,8 @@ from spectrum_acq.models import DeviceStatus, H1AutoExposureConfig, utc_now_iso
 from .h1_cie import cie_mode_from_name, cie_mode_name
 from .h1_serialize import spectrum_frame_to_json
 from .interfaces import H1Capture, H1ExposureAttempt, H1ExposureFrame, H1Status
+
+logger = logging.getLogger(__name__)
 
 
 class H1DeviceAdapter:
@@ -74,13 +77,17 @@ class H1DeviceAdapter:
     def get_exposure(self) -> dict[str, Any]:
         from h1_sdk.types import ExposureMode
 
-        dev = self._ensure_device()
-        mode = dev.get_exposure_mode()
-        return {
-            "mode": "auto" if mode == ExposureMode.Auto else "manual",
-            "timeUs": dev.get_exposure_time_us(),
-            "maxTimeUs": dev.get_max_exposure_time_us(),
-        }
+        # Route through _call_device so a dead serial handle is dropped (and
+        # re-opened on the next call) instead of being reused forever.
+        def work(dev: Any) -> dict[str, Any]:
+            mode = dev.get_exposure_mode()
+            return {
+                "mode": "auto" if mode == ExposureMode.Auto else "manual",
+                "timeUs": dev.get_exposure_time_us(),
+                "maxTimeUs": dev.get_max_exposure_time_us(),
+            }
+
+        return self._call_device(work)
 
     def patch_exposure(
         self,
@@ -91,39 +98,50 @@ class H1DeviceAdapter:
     ) -> dict[str, Any]:
         from h1_sdk.types import ExposureMode
 
-        dev = self._ensure_device()
-        if mode is not None:
-            dev.set_exposure_mode(ExposureMode.Auto if mode == "auto" else ExposureMode.Manual)
-        if time_us is not None:
-            dev.set_exposure_time_us(int(time_us))
-        if max_time_us is not None:
-            dev.set_max_exposure_time_us(int(max_time_us))
-        return self.get_exposure()
+        def work(dev: Any) -> dict[str, Any]:
+            if mode is not None:
+                dev.set_exposure_mode(ExposureMode.Auto if mode == "auto" else ExposureMode.Manual)
+            if time_us is not None:
+                dev.set_exposure_time_us(int(time_us))
+            if max_time_us is not None:
+                dev.set_max_exposure_time_us(int(max_time_us))
+            m = dev.get_exposure_mode()
+            return {
+                "mode": "auto" if m == ExposureMode.Auto else "manual",
+                "timeUs": dev.get_exposure_time_us(),
+                "maxTimeUs": dev.get_max_exposure_time_us(),
+            }
+
+        return self._call_device(work)
 
     def get_cie_mode(self) -> dict[str, str]:
-        dev = self._ensure_device()
-        return {"mode": cie_mode_name(dev.get_cie_mode())}
+        return self._call_device(lambda dev: {"mode": cie_mode_name(dev.get_cie_mode())})
 
     def set_cie_mode(self, mode_name: str) -> dict[str, str]:
         mode = cie_mode_from_name(mode_name)
-        dev = self._ensure_device()
-        dev.set_cie_mode(mode)
-        return self.get_cie_mode()
+
+        def work(dev: Any) -> dict[str, str]:
+            dev.set_cie_mode(mode)
+            return {"mode": cie_mode_name(dev.get_cie_mode())}
+
+        return self._call_device(work)
 
     def set_working_mode(self, mode: str) -> dict[str, str]:
         from h1_sdk.types import WorkingMode
 
-        dev = self._ensure_device()
-        working = WorkingMode.Trigger if mode == "trigger" else WorkingMode.Streaming
-        dev.set_working_mode(working)
-        return {"mode": mode}
+        def work(dev: Any) -> dict[str, str]:
+            working = WorkingMode.Trigger if mode == "trigger" else WorkingMode.Streaming
+            dev.set_working_mode(working)
+            return {"mode": mode}
+
+        return self._call_device(work)
 
     def enter_sleep(self) -> dict[str, Any]:
-        self._ensure_device().enter_sleep()
+        self._call_device(lambda dev: dev.enter_sleep())
         return {"ok": True, "state": "sleeping"}
 
     def exit_sleep(self) -> dict[str, Any]:
-        self._ensure_device().exit_sleep()
+        self._call_device(lambda dev: dev.exit_sleep())
         return {"ok": True, "state": "awake"}
 
     def capture_single_frame(self, *, include_tm30: bool = False) -> dict[str, Any]:
@@ -139,24 +157,28 @@ class H1DeviceAdapter:
         return self._call_device(work)
 
     def upload_efficiency_curve(self, ratios: list[float]) -> dict[str, Any]:
-        dev = self._ensure_device()
-        dev.upload_efficiency_curve(ratios)
+        self._call_device(lambda dev: dev.upload_efficiency_curve(ratios))
         return {"ok": True, "count": len(ratios)}
 
     def verify_efficiency_curve(self) -> dict[str, Any]:
-        self._ensure_device().verify_and_compute_efficiency_curve()
+        self._call_device(lambda dev: dev.verify_and_compute_efficiency_curve())
         return {"ok": True}
 
     def reset_efficiency_curve(self) -> dict[str, Any]:
-        self._ensure_device().reset_efficiency_curve()
+        self._call_device(lambda dev: dev.reset_efficiency_curve())
         return {"ok": True}
 
     def capture_auto(self, config: H1AutoExposureConfig) -> H1Capture:
-        dev = self._ensure_device()
-        status = self._status_from_device(dev)
-        if status.status != DeviceStatus.READY:
-            raise RuntimeError(status.detail.get("error", "H1 device is not ready"))
-        return self._capture_auto_with_device(dev, config, status=status)
+        # Route through _call_device: a hard pyserial error anywhere in the
+        # capture (status read, convergence, restore) drops the dead handle so
+        # the next call re-opens the port instead of reusing a broken one.
+        def work(dev: Any) -> H1Capture:
+            status = self._status_from_device(dev)
+            if status.status != DeviceStatus.READY:
+                raise RuntimeError(status.detail.get("error", "H1 device is not ready"))
+            return self._capture_auto_with_device(dev, config, status=status)
+
+        return self._call_device(work)
 
     def _status_from_device(self, dev: Any) -> H1Status:
         info = dev.get_device_info()
@@ -301,6 +323,11 @@ class H1DeviceAdapter:
                 active_status.exposure_time_us or config.initial_exposure_us, config
             )
 
+        converged = False
+        # Count of manual refinement steps already taken. After the first one we
+        # let the search seed a missing bracket bound from the config limits so a
+        # far-off native-auto pick still converges via geometric bisection.
+        refinements = 0
         for idx in range(1, max_attempts + 1):
             if idx == 2 and used_auto:
                 # Hand off from native auto to deterministic manual refinement.
@@ -317,6 +344,7 @@ class H1DeviceAdapter:
             pairs.append((attempt, frame))
             status = attempt.exposure_status
             if status == "normal":
+                converged = True
                 break
 
             exposure_us = clamp_exposure_us(attempt.exposure_time_us, config)
@@ -325,13 +353,38 @@ class H1DeviceAdapter:
             elif status == "over":
                 over_bound = exposure_us if over_bound is None else min(over_bound, exposure_us)
 
+            # After the first refinement step, seed the missing bracket bound from
+            # the config limits so geometric bisection engages even when only one
+            # of under/over has been seen.
             nxt = next_exposure_time_us(
-                exposure_us, status, config, under_bound=under_bound, over_bound=over_bound
+                exposure_us,
+                status,
+                config,
+                under_bound=under_bound,
+                over_bound=over_bound,
+                seed_missing_bound=refinements >= 1,
             )
+            refinements += 1
             if nxt == exposure_us:
                 # Clamped at a limit / bracket collapsed — no better exposure to try.
                 break
             next_exposure_us = nxt
+
+        if not converged:
+            # Surface a signal so callers/operators can see the auto-exposure
+            # search ran out of attempts without landing a ``normal`` frame.
+            last_status = pairs[-1][0].exposure_status if pairs else "none"
+            last_exposure = pairs[-1][0].exposure_time_us if pairs else None
+            logger.warning(
+                "h1_exposure_not_converged: port=%s attempts=%d last_status=%s "
+                "last_exposure_us=%s under_bound=%s over_bound=%s",
+                self.port,
+                len(pairs),
+                last_status,
+                last_exposure,
+                under_bound,
+                over_bound,
+            )
 
         return pairs
 
@@ -469,24 +522,34 @@ class H1DeviceAdapter:
         max_frames: int | None = None,
         config: H1AutoExposureConfig | None = None,
     ) -> Iterator[dict[str, Any]]:
-        dev = self._ensure_device()
-        wavelength_range = dev.get_wavelength_range()
-        frame_timeout = self.timeout_s
-        # Default stop-drain covers a trailing frame at the base timeout.
-        stop_drain_s = 1.0
-        if config is not None:
-            cap_us = self._enable_stream_auto_exposure(dev, config)
-            frame_timeout = capture_timeout_s(cap_us, self.timeout_s)
-            # A trailing frame starts arriving ~one exposure (cap) after the stop;
-            # drain a little longer than that so it's consumed before the next cmd.
-            stop_drain_s = (cap_us / 1_000_000.0) + 0.4
-        for frame in dev.stream(
-            include_tm30=include_tm30,
-            max_frames=max_frames,
-            frame_timeout=frame_timeout,
-            stop_drain_s=stop_drain_s,
-        ):
-            yield spectrum_frame_to_json(frame, wavelength_range.start)
+        # Reset the device handle on ANY exception escaping the generator (a hard
+        # pyserial error during setup or mid-stream) so a dead handle isn't
+        # reused on the next stream/capture. The whole generator runs on a single
+        # thread (driven by the SSE bridge), so _reset_device() — including the
+        # SDK's RLock release inside dev.close() — stays on the acquiring thread.
+        try:
+            dev = self._ensure_device()
+            wavelength_range = dev.get_wavelength_range()
+            frame_timeout = self.timeout_s
+            # Default stop-drain covers a trailing frame at the base timeout.
+            stop_drain_s = 1.0
+            if config is not None:
+                cap_us = self._enable_stream_auto_exposure(dev, config)
+                frame_timeout = capture_timeout_s(cap_us, self.timeout_s)
+                # A trailing frame starts arriving ~one exposure (cap) after the
+                # stop; drain a little longer than that so it's consumed before
+                # the next cmd.
+                stop_drain_s = (cap_us / 1_000_000.0) + 0.4
+            for frame in dev.stream(
+                include_tm30=include_tm30,
+                max_frames=max_frames,
+                frame_timeout=frame_timeout,
+                stop_drain_s=stop_drain_s,
+            ):
+                yield spectrum_frame_to_json(frame, wavelength_range.start)
+        except Exception:
+            self._reset_device()
+            raise
 
 
 def spectrum_frame_to_stream_payload(frame: Any, wavelength_start: int) -> dict[str, Any]:
@@ -509,12 +572,36 @@ def next_exposure_time_us(
     *,
     under_bound: int | None = None,
     over_bound: int | None = None,
+    seed_missing_bound: bool = False,
 ) -> int:
     # Once the target is bracketed (we have seen both an under and an over
     # exposure), bisect geometrically between the bounds. This converges in a few
     # steps instead of oscillating on the fixed under/over multipliers.
     if under_bound is not None and over_bound is not None and over_bound > under_bound:
         return clamp_exposure_us(int(round((under_bound * over_bound) ** 0.5)), config)
+
+    # Not yet bracketed. From a far-off native-auto pick the fixed under/over
+    # multipliers can't traverse the whole range inside ``max_attempts``, so a
+    # bracket may never form. When the caller asks (after the first manual
+    # refinement step), seed the still-missing bound from the config exposure
+    # limits and bisect geometrically — this engages binary search and converges
+    # in ~log2(range) steps regardless of how far off the starting point is.
+    if seed_missing_bound and (under_bound is None) != (over_bound is None):
+        if under_bound is None and exposure_status == "over":
+            # Target is below ``exposure_us``; the floor can't be over, so the
+            # lowest possible exposure is a safe under bound.
+            lo = config.min_exposure_us
+            hi = over_bound if over_bound is not None else exposure_us
+            if hi > lo:
+                return clamp_exposure_us(int(round((lo * hi) ** 0.5)), config)
+        if over_bound is None and exposure_status == "under":
+            # Target is above ``exposure_us``; the ceiling can't be under, so the
+            # highest possible exposure is a safe over bound.
+            lo = under_bound if under_bound is not None else exposure_us
+            hi = config.max_exposure_us
+            if hi > lo:
+                return clamp_exposure_us(int(round((lo * hi) ** 0.5)), config)
+
     if exposure_status == "under":
         return clamp_exposure_us(int(exposure_us * config.under_multiplier), config)
     if exposure_status == "over":
@@ -523,16 +610,28 @@ def next_exposure_time_us(
 
 
 def ladder_factors(steps: int) -> list[float]:
-    """Symmetric geometric multipliers around 1.0 for the multi-exposure ladder.
+    """Geometric multipliers around 1.0 for the multi-exposure ladder.
 
-    ``steps=5`` -> ``[0.25, 0.5, 1.0, 2.0, 4.0]``; ``steps=1`` -> ``[1.0]``.
+    The centred ``1.0x`` rung (the auto-chosen exposure) is ALWAYS included. For
+    an odd ``steps`` the rungs are symmetric about 1.0x. For an even ``steps`` we
+    keep the same one-octave-per-rung spacing but anchor a rung at exactly 1.0x
+    (slightly more headroom above than below), so the auto-chosen exposure is
+    never skipped.
+
+    ``steps=5`` -> ``[0.25, 0.5, 1.0, 2.0, 4.0]``; ``steps=1`` -> ``[1.0]``;
+    ``steps=4`` -> ``[0.5, 1.0, 2.0, 4.0]`` (1.0x present).
     """
     steps = max(int(steps), 1)
     if steps == 1:
         return [1.0]
-    half = (steps - 1) / 2.0
-    span = 2.0  # +-2 octaves at the ends (x0.25 .. x4)
-    return [2.0 ** (span * (i - half) / half) for i in range(steps)]
+    if steps % 2 == 1:
+        span = 2.0  # +-2 octaves at the ends (x0.25 .. x4) for the canonical 5
+        half = (steps - 1) / 2.0
+        return [2.0 ** (span * (i - half) / half) for i in range(steps)]
+    # Even count: one octave per rung, anchored so index ``steps // 2 - 1`` is
+    # exactly 1.0x. This guarantees the centred rung is present.
+    center_idx = steps // 2 - 1
+    return [2.0 ** float(i - center_idx) for i in range(steps)]
 
 
 def select_index(

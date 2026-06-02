@@ -16,7 +16,15 @@ listener_pid() {
   ss -ltnp 2>/dev/null | sed -n "s/.*:$1 .*pid=\\([0-9]*\\).*/\\1/p" | head -n1
 }
 
-if ss -ltn 2>/dev/null | grep -q ":$api_port "; then
+# True if something is already listening on the given TCP port. Match the
+# Local Address:Port column precisely: the port must be preceded by ':' and
+# followed by whitespace, anchored to that column, so e.g. port 800 cannot
+# false-match a listener on 8000 (or an address that merely contains "800").
+port_in_use() {
+  ss -ltn 2>/dev/null | awk -v p=":$1\$" '$4 ~ p {found=1} END {exit found ? 0 : 1}'
+}
+
+if port_in_use "$api_port"; then
   listener_pid "$api_port" > logs/acquisition.pid
 else
   nohup acquisition/.venv/bin/spectrum-acq \
@@ -28,7 +36,7 @@ else
   echo "$!" > logs/acquisition.pid
 fi
 
-if ss -ltn 2>/dev/null | grep -q ":$web_port "; then
+if port_in_use "$web_port"; then
   listener_pid "$web_port" > logs/webui.pid
 else
   ACQUISITION_API_BASE_URL="http://127.0.0.1:$api_port" \

@@ -4,15 +4,30 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import queue
 import threading
 from typing import Any, Iterator
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
+from spectrum_acq.api.auth import require_token
 from spectrum_acq.capture.coordinator import CaptureCoordinator
 from spectrum_acq.models import json_dumps, to_jsonable
+
+logger = logging.getLogger(__name__)
+
+# Bounded window (seconds) we are willing to block the HTTP response while the
+# stream producer thread tears the SDK generator down and releases the device
+# lock. The producer can only observe a disconnect *between* frames, so its
+# in-flight ``_read_frame`` may still cost up to ``frame_timeout`` before the
+# ``for`` loop notices ``stop`` and runs the generator's ``finally``. We join
+# for a little longer than the longest expected single-frame read so the hold
+# window is explicit and short; if the join still times out we return anyway
+# (the daemon producer keeps running and releases the lock when its read
+# finally completes) rather than wedging the request handler.
+_PRODUCER_JOIN_TIMEOUT_S = 12.0
 
 
 def register_h1_routes(app: FastAPI, coordinator: CaptureCoordinator) -> None:
@@ -24,7 +39,7 @@ def register_h1_routes(app: FastAPI, coordinator: CaptureCoordinator) -> None:
     def h1_get_exposure() -> dict[str, Any]:
         return _run_h1(coordinator, coordinator.h1_get_exposure)
 
-    @app.patch("/h1/exposure")
+    @app.patch("/h1/exposure", dependencies=[Depends(require_token)])
     async def h1_patch_exposure(body: dict[str, Any]) -> dict[str, Any]:
         mode = body.get("mode")
         if mode is not None and mode not in {"auto", "manual"}:
@@ -48,7 +63,7 @@ def register_h1_routes(app: FastAPI, coordinator: CaptureCoordinator) -> None:
     def h1_get_cie_mode() -> dict[str, str]:
         return _run_h1(coordinator, coordinator.h1_get_cie_mode)
 
-    @app.put("/h1/cie-mode")
+    @app.put("/h1/cie-mode", dependencies=[Depends(require_token)])
     async def h1_put_cie_mode(body: dict[str, Any]) -> dict[str, str]:
         mode = body.get("mode")
         if not isinstance(mode, str):
@@ -58,26 +73,26 @@ def register_h1_routes(app: FastAPI, coordinator: CaptureCoordinator) -> None:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    @app.put("/h1/working-mode")
+    @app.put("/h1/working-mode", dependencies=[Depends(require_token)])
     async def h1_put_working_mode(body: dict[str, Any]) -> dict[str, str]:
         mode = body.get("mode")
         if mode not in {"streaming", "trigger"}:
             raise HTTPException(status_code=400, detail='mode must be "streaming" or "trigger"')
         return _run_h1(coordinator, lambda: coordinator.h1_set_working_mode(str(mode)))
 
-    @app.post("/h1/sleep")
+    @app.post("/h1/sleep", dependencies=[Depends(require_token)])
     def h1_sleep() -> dict[str, Any]:
         return _run_h1(coordinator, coordinator.h1_enter_sleep)
 
-    @app.post("/h1/wake")
+    @app.post("/h1/wake", dependencies=[Depends(require_token)])
     def h1_wake() -> dict[str, Any]:
         return _run_h1(coordinator, coordinator.h1_exit_sleep)
 
-    @app.post("/h1/capture")
+    @app.post("/h1/capture", dependencies=[Depends(require_token)])
     def h1_capture(tm30: bool = Query(default=False)) -> dict[str, Any]:
         return to_jsonable(_run_h1(coordinator, lambda: coordinator.h1_capture_single(include_tm30=tm30)))
 
-    @app.post("/h1/efficiency-curve")
+    @app.post("/h1/efficiency-curve", dependencies=[Depends(require_token)])
     async def h1_upload_efficiency_curve(body: dict[str, Any]) -> dict[str, Any]:
         ratios = body.get("ratios")
         if not isinstance(ratios, list) or len(ratios) == 0:
@@ -92,11 +107,11 @@ def register_h1_routes(app: FastAPI, coordinator: CaptureCoordinator) -> None:
             floats.append(numeric)
         return _run_h1(coordinator, lambda: coordinator.h1_upload_efficiency_curve(floats))
 
-    @app.post("/h1/efficiency-curve/verify")
+    @app.post("/h1/efficiency-curve/verify", dependencies=[Depends(require_token)])
     def h1_verify_efficiency_curve() -> dict[str, Any]:
         return _run_h1(coordinator, coordinator.h1_verify_efficiency_curve)
 
-    @app.post("/h1/efficiency-curve/reset")
+    @app.post("/h1/efficiency-curve/reset", dependencies=[Depends(require_token)])
     def h1_reset_efficiency_curve() -> dict[str, Any]:
         return _run_h1(coordinator, coordinator.h1_reset_efficiency_curve)
 
@@ -140,13 +155,30 @@ def _bridge_sync_stream(make_gen, *, maxsize: int = 32):
     entirely on one dedicated worker thread, so it is also *closed* on that thread
     — keeping the lock acquire/release on the same thread. Frames flow to the event
     loop through a bounded queue; client disconnect stops the worker deterministically.
+
+    ``make_gen`` may optionally accept a ``stop`` keyword (a ``threading.Event``)
+    so the producer can hand the cancellation signal down to the device stream;
+    this lets the SDK shorten its per-frame ``frame_timeout`` once a stop is
+    requested instead of blocking the full read window. We pass it only when the
+    callable advertises the parameter, so the contract stays backward compatible
+    with the current ``coordinator.stream_h1`` (which ignores it).
     """
     q: "queue.Queue[tuple[str, str] | None]" = queue.Queue(maxsize=maxsize)
     stop = threading.Event()
     SENTINEL = None
 
+    def _open_gen() -> Iterator[dict[str, Any]]:
+        # Forward the stop event only if the producer's generator factory can
+        # consume it, so a disconnect can be observed *inside* the device read
+        # (small per-frame timeout) rather than only between frames. Falls back
+        # to the no-arg form for the existing coordinator contract.
+        try:
+            return make_gen(stop=stop)
+        except TypeError:
+            return make_gen()
+
     def producer() -> None:
-        gen: Iterator[dict[str, Any]] = make_gen()
+        gen: Iterator[dict[str, Any]] = _open_gen()
         try:
             for frame in gen:
                 if stop.is_set():
@@ -167,7 +199,8 @@ def _bridge_sync_stream(make_gen, *, maxsize: int = 32):
         finally:
             # Runs the SDK + coordinator ``finally`` blocks on THIS thread: sends
             # CMD 0x04 and releases the device/coordinator locks on the acquiring
-            # thread.
+            # thread. (Closing from any other thread would hit the RLock cross-thread
+            # release bug, so the close MUST stay here.)
             gen.close()
             try:
                 q.put(SENTINEL, timeout=1.0)
@@ -199,6 +232,21 @@ def _bridge_sync_stream(make_gen, *, maxsize: int = 32):
                     pass
             except queue.Empty:
                 pass
+            # Make the lock-hold window explicit and bounded: wait (off the event
+            # loop) for the producer to run the generator's ``finally`` — which
+            # sends CMD 0x04 and releases the device lock on the acquiring thread.
+            # The producer can only notice ``stop`` between frames, so an in-flight
+            # ``_read_frame`` may delay this by up to one frame timeout; we bound
+            # the wait so the response handler never blocks indefinitely. If it
+            # times out the daemon producer keeps draining and releases the lock as
+            # soon as its read returns.
+            await loop.run_in_executor(None, lambda: thread.join(_PRODUCER_JOIN_TIMEOUT_S))
+            if thread.is_alive():
+                logger.warning(
+                    "h1 stream producer still draining %.1fs after disconnect; "
+                    "device lock will free once the in-flight frame read returns",
+                    _PRODUCER_JOIN_TIMEOUT_S,
+                )
 
     return event_stream()
 
@@ -213,7 +261,13 @@ def _run_h1(coordinator: CaptureCoordinator, fn):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
-        detail: dict[str, Any] = {"error": str(exc)}
+        # Don't leak raw internal exception text (paths, low-level driver/serial
+        # messages, etc.) to the client. Surface a generic device-error message
+        # and keep only the structured device-protocol fields (status code /
+        # command type) that callers legitimately key off. Full details go to the
+        # server log for diagnosis.
+        logger.exception("H1 device operation failed")
+        detail: dict[str, Any] = {"error": "H1 device operation failed"}
         code = getattr(exc, "code", None)
         cmd_type = getattr(exc, "cmd_type", None)
         if code is not None:

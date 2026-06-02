@@ -1,6 +1,6 @@
 'use client';
 
-import { Camera, Pause, Play } from 'lucide-react';
+import { Camera, Pause, Play, RotateCcw } from 'lucide-react';
 import { useMemo, useState } from 'react';
 
 import { SpectrumChart } from '@/components/spectrum-chart';
@@ -41,7 +41,7 @@ export function SpectrometerLivePanel({
   // Toggling tm30 re-subscribes the stream (useSpectrumStream deps), which
   // restarts it with 0x35 instead of 0x33 — the stop/restart PROTOCOL.md §8.3
   // requires to switch TM-30.
-  const { frame, stats } = useSpectrumStream({ enabled: running && streamAllowed, tm30 });
+  const { frame, stats, retry } = useSpectrumStream({ enabled: running && streamAllowed, tm30 });
 
   const mainRgbUrl = useMemo(
     () => `${acquisitionPath('/preview/main_rgb/frame')}?v=${previewVersion}`,
@@ -95,16 +95,30 @@ export function SpectrometerLivePanel({
         />
         <div className="space-y-3">
           <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
-            <Badge variant={stats.open ? 'default' : 'secondary'}>
-              {stats.open ? '光谱流已连接' : running ? '连接中…' : '光谱流已停止'}
+            <Badge variant={stats.open ? 'default' : stats.stopped ? 'destructive' : 'secondary'}>
+              {stats.open
+                ? '光谱流已连接'
+                : stats.stopped
+                  ? '光谱流已断开'
+                  : running
+                    ? '连接中…'
+                    : '光谱流已停止'}
             </Badge>
+            {/* The stream self-terminates after repeated drops (so it stops
+                re-driving the H1); offer an explicit retry instead of auto-storming. */}
+            {stats.stopped && streamAllowed && running ? (
+              <Button variant="outline" size="sm" onClick={retry}>
+                <RotateCcw className="h-4 w-4" />
+                重新连接
+              </Button>
+            ) : null}
             {stats.open ? (
               <>
                 <StreamStat label="FPS">{numFixed(stats.fps, 1)}</StreamStat>
                 <StreamStat label="帧数">{numInt(stats.frameCount)}</StreamStat>
               </>
             ) : null}
-            {frame ? (
+            {stats.open && frame ? (
               <>
                 <StreamStat label="状态">
                   <ExposureStatusBadge status={frame.exposureStatus} />
@@ -119,7 +133,9 @@ export function SpectrometerLivePanel({
             ) : null}
             {stats.lastError ? <span className="text-xs text-destructive">{stats.lastError}</span> : null}
           </div>
-          {frame ? (
+          {/* Only render the chart while the stream is actually connected so a
+              disconnect never leaves the last frame on screen as if it were live. */}
+          {stats.open && frame ? (
             <div className="rounded-md border p-2">
               <SpectrumChart wavelengths={frame.wavelengths} values={frame.actualSpectrum} />
             </div>
@@ -131,10 +147,12 @@ export function SpectrometerLivePanel({
                 'H1 未就绪'
               ) : disabled ? (
                 '采集中，光谱流已暂停'
-              ) : running ? (
-                '正在执行自动曝光并等待第一帧…'
-              ) : (
+              ) : !running ? (
                 '点击右上角开始光谱流，与主 RGB 对照视场'
+              ) : stats.stopped ? (
+                '光谱流已断开，点击“重新连接”恢复'
+              ) : (
+                '正在执行自动曝光并等待第一帧…'
               )}
             </div>
           )}

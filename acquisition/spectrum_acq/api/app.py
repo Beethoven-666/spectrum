@@ -4,26 +4,36 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, Response, StreamingResponse
 import numpy as np
 from PIL import Image
 
 from spectrum_acq import __version__
+from spectrum_acq import paths
+from spectrum_acq.api.auth import require_token
 from spectrum_acq.api.h1_routes import register_h1_routes
 from spectrum_acq.capture.coordinator import CaptureCoordinator, create_default_coordinator
 from spectrum_acq.config import load_config, save_config
 from spectrum_acq.models import AcquisitionConfig, Roi, to_jsonable
+
+logger = logging.getLogger(__name__)
 
 SAMPLE_FILE_PREVIEWS = {
     "d455/color.jpg": ("d455/color.jpg", "image/jpeg"),
     "d455/depth.png": ("d455/depth.png", "image/png"),
     "h1/spectrum.json": ("h1/spectrum.json", "application/json"),
 }
+
+# L1: only these H1 auto-exposure modes are accepted from request bodies;
+# anything else is rejected with HTTP 400 rather than silently falling through.
+VALID_EXPOSURE_MODES = {"conservative", "strict", "multi_exposure"}
 
 
 def create_app(config: AcquisitionConfig | None = None) -> FastAPI:
@@ -71,8 +81,11 @@ def create_app(config: AcquisitionConfig | None = None) -> FastAPI:
     def get_config() -> dict[str, Any]:
         return to_jsonable(active_config)
 
-    @app.put("/config")
-    async def put_config(body: dict[str, Any]) -> dict[str, Any]:
+    # M1: plain ``def`` so FastAPI runs these blocking handlers (file I/O,
+    # config reload, capture) in its threadpool instead of stalling the event
+    # loop. H1: state-changing routes are gated behind ``require_token``.
+    @app.put("/config", dependencies=[Depends(require_token)])
+    def put_config(body: dict[str, Any]) -> dict[str, Any]:
         cfg_path = active_config.data_dir / "config" / "acquisition.json"
         cfg_path.parent.mkdir(parents=True, exist_ok=True)
         current_payload = to_jsonable(active_config)
@@ -96,16 +109,27 @@ def create_app(config: AcquisitionConfig | None = None) -> FastAPI:
 
     register_preview_routes(app, coordinator)
 
-    @app.post("/capture")
-    async def capture(body: dict[str, Any] | None = None) -> dict[str, Any]:
+    @app.post("/capture", dependencies=[Depends(require_token)])
+    def capture(body: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = body or {}
         roi = None
         if isinstance(payload.get("roi"), dict):
-            roi = Roi(**payload["roi"])
+            # Unverified-low: a malformed roi object (unknown/extra keys, wrong
+            # types) makes Roi(**...) raise TypeError. Surface that as 400
+            # rather than letting it bubble up to a 500.
+            try:
+                roi = Roi(**payload["roi"])
+            except TypeError as exc:
+                raise HTTPException(status_code=400, detail="invalid roi") from exc
+        # L1: validate the requested exposure mode up front instead of letting
+        # an unknown value silently reach the coordinator.
+        exposure_mode = payload.get("exposure_mode")
+        if exposure_mode is not None and exposure_mode not in VALID_EXPOSURE_MODES:
+            raise HTTPException(status_code=400, detail="invalid exposure_mode")
         try:
             result = coordinator.capture(
                 roi=roi,
-                exposure_mode=payload.get("exposure_mode"),
+                exposure_mode=exposure_mode,
                 force=bool(payload.get("force", False)),
             )
         except RuntimeError as exc:
@@ -147,23 +171,37 @@ def create_app(config: AcquisitionConfig | None = None) -> FastAPI:
             "quality": _read_json(quality_path),
         }
 
-    @app.get("/samples/{sample_id}/download")
+    # H1: sample file-access routes are gated behind ``require_token``.
+    # M17: validate the id and require it to exist in the index before
+    # touching the filesystem (the hardened SampleStore.sample_path adds
+    # path-traversal containment as a second layer of defence).
+    @app.get("/samples/{sample_id}/download", dependencies=[Depends(require_token)])
     def sample_download(sample_id: str) -> FileResponse:
+        if not paths.valid_name(sample_id):
+            raise HTTPException(status_code=404, detail="sample not found")
+        if coordinator.store.get_sample(sample_id) is None:
+            raise HTTPException(status_code=404, detail="sample not found")
         try:
             archive = coordinator.store.export_sample_zip(sample_id)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="sample not found") from exc
         return FileResponse(archive, filename=archive.name, media_type="application/zip")
 
-    @app.get("/samples/{sample_id}/preview")
+    @app.get("/samples/{sample_id}/preview", dependencies=[Depends(require_token)])
     def sample_preview(sample_id: str) -> FileResponse:
+        if not paths.valid_name(sample_id):
+            raise HTTPException(status_code=404, detail="preview not found")
+        if coordinator.store.get_sample(sample_id) is None:
+            raise HTTPException(status_code=404, detail="preview not found")
         preview = coordinator.store.sample_path(sample_id) / "roi" / "preview.jpg"
         if not preview.exists():
             raise HTTPException(status_code=404, detail="preview not found")
         return FileResponse(preview, media_type="image/jpeg")
 
-    @app.get("/samples/{sample_id}/files/{file_key:path}")
+    @app.get("/samples/{sample_id}/files/{file_key:path}", dependencies=[Depends(require_token)])
     def sample_file_preview(sample_id: str, file_key: str) -> FileResponse:
+        if not paths.valid_name(sample_id):
+            raise HTTPException(status_code=404, detail="sample not found")
         if coordinator.store.get_sample(sample_id) is None:
             raise HTTPException(status_code=404, detail="sample not found")
         file_def = SAMPLE_FILE_PREVIEWS.get(file_key)
@@ -175,18 +213,29 @@ def create_app(config: AcquisitionConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="sample file not found")
         return FileResponse(sample_file, media_type=media_type)
 
-    @app.post("/samples/export")
+    @app.post("/samples/export", dependencies=[Depends(require_token)])
     def export_samples(body: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = body or {}
         if payload:
+            # Unverified-low: clamp the requested limit to a sane bound (1..1000)
+            # so a caller can't request an unbounded export. A non-integer value
+            # is rejected with 400 rather than raising a ValueError -> 500.
+            try:
+                limit = int(payload.get("limit", 1000))
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail="invalid limit") from exc
+            limit = max(1, min(limit, 1000))
             archive = coordinator.store.export_filtered_zip(
                 quality_status=payload.get("quality_status"),
                 calibration_version=payload.get("calibration_version"),
-                limit=int(payload.get("limit", 1000)),
+                limit=limit,
             )
         else:
             archive = coordinator.store.export_all_zip()
-        return {"archive": str(archive), "filename": archive.name}
+        # Unverified-low: do not leak the absolute server filesystem path. Return
+        # only the archive's basename as an opaque reference; the existing
+        # download routes (keyed by filename) remain the way to fetch it.
+        return {"filename": archive.name}
 
     @app.get("/calibration")
     def calibration() -> dict[str, Any]:
@@ -196,19 +245,37 @@ def create_app(config: AcquisitionConfig | None = None) -> FastAPI:
         exists = Path(path).exists()
         return {"status": "configured" if exists else "missing", "version": Path(path).stem, "path": str(path)}
 
-    @app.put("/calibration")
-    async def put_calibration(body: dict[str, Any]) -> dict[str, Any]:
+    @app.put("/calibration", dependencies=[Depends(require_token)])
+    def put_calibration(body: dict[str, Any]) -> dict[str, Any]:
         version = str(body.get("version", "manual"))
-        out = active_config.data_dir / "calibration" / f"{version}.json"
-        out.parent.mkdir(parents=True, exist_ok=True)
+        calib_dir = active_config.data_dir / "calibration"
+        calib_dir.mkdir(parents=True, exist_ok=True)
+        # H2: the version comes straight from the request body and is used as a
+        # filename, so route it through safe_join (which enforces valid_name and
+        # path containment) instead of trusting it. Reject traversal/injection
+        # attempts with 400 rather than writing outside calib_dir.
+        try:
+            out = paths.safe_join(calib_dir, f"{version}.json")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid calibration version") from exc
         payload = {**body, "version": version}
-        out.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        next_config = type(active_config)(**{**active_config.__dict__, "calibration_path": out})
-        save_config(next_config)
-        apply_config(next_config)
+        try:
+            out.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            next_config = type(active_config)(**{**active_config.__dict__, "calibration_path": out})
+            save_config(next_config)
+            apply_config(next_config)
+        except Exception:  # noqa: BLE001
+            # L3: never leak str(exc)/internals to the client. Log the detail
+            # server-side with a correlation id and return a generic message.
+            correlation_id = uuid.uuid4().hex[:12]
+            logger.exception("calibration save failed (correlation_id=%s)", correlation_id)
+            raise HTTPException(
+                status_code=500,
+                detail=f"calibration save failed (ref {correlation_id})",
+            ) from None
         return {"status": "saved", "version": version, "path": str(out)}
 
     return app
@@ -286,7 +353,13 @@ def register_preview_routes(app: FastAPI, coordinator: CaptureCoordinator) -> No
 
 
 def _read_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"))
+    # Unverified-low: a sample whose metadata/quality file is missing or
+    # corrupt must not 500 the detail endpoint. Return None so the caller can
+    # render a partial record instead.
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
 
 
 def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:

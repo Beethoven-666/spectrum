@@ -11,13 +11,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from spectrum_acq.config import default_config
 from spectrum_acq.devices.h1 import H1DeviceAdapter
-from spectrum_acq.devices.interfaces import CameraStream, H1Spectrometer, MainRgbCapture
+from spectrum_acq.devices.interfaces import (
+    CameraStream,
+    D455Snapshot,
+    H1Spectrometer,
+    MainRgbCapture,
+)
 from spectrum_acq.devices.main_rgb import V4l2MainRgbCamera
 from spectrum_acq.devices.mock import MockD455Camera, MockH1Spectrometer, NullMainRgbProvider
-from spectrum_acq.devices.streaming import CameraWorker, DirectStream
+from spectrum_acq.devices.streaming import CameraTimeout, CameraWorker, DirectStream
 from spectrum_acq.geometry import compute_geometry
+from spectrum_acq.geometry.pointcloud import GeometryResult, PointCloudResult
 from spectrum_acq.models import (
     AcquisitionConfig,
     CaptureResult,
@@ -64,14 +72,25 @@ class CaptureCoordinator:
             finally:
                 self._lock.release()
         else:
-            h1_status = self._last_h1_status or {
-                "status": str(DeviceStatus.ERROR),
-                "serial_number": None,
-                "wavelength_range": None,
-                "exposure_time_us": None,
-                "exposure_mode": None,
-                "max_exposure_time_us": None,
-                "detail": {"error": "H1 capture or stream is busy"},
+            # The H1 is single-owner: while a capture/stream holds the lock we
+            # cannot read a live status. Returning the last cached snapshot as-is
+            # would mislead the UI (stale READY) and fabricating ERROR would raise
+            # a false alarm. Instead present an explicit, non-READY "busy" status
+            # with a stale marker, carrying the last-known identity fields so the
+            # UI keeps the serial/wavelength without claiming the device is live.
+            last = self._last_h1_status or {}
+            h1_status = {
+                "status": "busy",
+                "stale": True,
+                "serial_number": last.get("serial_number"),
+                "wavelength_range": last.get("wavelength_range"),
+                "exposure_time_us": last.get("exposure_time_us"),
+                "exposure_mode": last.get("exposure_mode"),
+                "max_exposure_time_us": last.get("max_exposure_time_us"),
+                "detail": {
+                    "reason": "busy",
+                    "error": "H1 capture or stream is busy; status is stale",
+                },
             }
         return {
             "h1": h1_status,
@@ -175,7 +194,20 @@ class CaptureCoordinator:
                 h1_config = type(h1_config)(**{**asdict(h1_config), "mode": exposure_mode})
 
             self._set_state(CaptureState.CAPTURING, sample_id=sample_id)
-            d455_snapshot = self.d455.get_fresh()
+            # M10: the D455 can brown out (Pi5 USB under-voltage) and time out
+            # mid-capture. The spectrum is the irreplaceable measurement, so when
+            # the operator has opted in via ``force`` we degrade to a
+            # spectrum-only sample (geometry omitted, quality BAD) rather than
+            # discarding a good H1 reading. Without ``force`` the timeout still
+            # fails the capture, matching the strict-exposure gate above.
+            depth_available = True
+            try:
+                d455_snapshot = self.d455.get_fresh()
+            except CameraTimeout as exc:
+                if not force:
+                    raise
+                depth_available = False
+                d455_snapshot = _depth_unavailable_snapshot(str(exc))
             h1_capture = self.h1.capture_auto(h1_config)
             if (
                 h1_config.mode == "strict"
@@ -187,12 +219,18 @@ class CaptureCoordinator:
                 )
             main_rgb_capture = self._capture_main_rgb()
 
-            pointcloud, geometry = compute_geometry(
-                d455_snapshot.depth_mm,
-                d455_snapshot.intrinsics,
-                active_roi,
-                self.config.quality,
-            )
+            if depth_available:
+                pointcloud, geometry = compute_geometry(
+                    d455_snapshot.depth_mm,
+                    d455_snapshot.intrinsics,
+                    active_roi,
+                    self.config.quality,
+                )
+            else:
+                # No depth frame: emit an empty point cloud and an "unavailable"
+                # geometry result carrying a depth_unavailable warning so the
+                # sample is clearly marked BAD downstream (see _quality).
+                pointcloud, geometry = _depth_unavailable_geometry()
             quality = self._quality(
                 h1_capture=h1_capture,
                 d455_snapshot=d455_snapshot,
@@ -251,7 +289,9 @@ class CaptureCoordinator:
         warnings.extend(geometry.warnings)
         if geometry.warnings:
             status = QualityStatus.WARN
-        if any(w in geometry.warnings for w in ["angle_bad", "distance_unknown"]):
+        # M10: a missing depth frame (degraded, force-only capture) is as
+        # disqualifying for geometry as a bad angle/unknown distance — mark BAD.
+        if any(w in geometry.warnings for w in ["angle_bad", "distance_unknown", "depth_unavailable"]):
             status = QualityStatus.BAD
         if storage_status["status"] == QualityStatus.WARN:
             warnings.append("disk_space_warn")
@@ -391,6 +431,15 @@ class CaptureCoordinator:
         self.store.config = next_config
         if next_config.mock or prev.mock:
             return  # mock<->hardware switch is handled by a service restart
+        # M3: hot-swap each worker by PUBLISHING the new worker into self.d455 /
+        # self.main_rgb *before* closing the old one. A concurrent get_fresh()/
+        # preview() therefore reads either the old worker (still live) or the new
+        # one — never a half-closed handle. The reference swap is atomic in
+        # CPython (single attribute store under the GIL), and closing the old
+        # worker is independently safe: CameraWorker.close() sets its terminal
+        # _closed flag under _start_lock so any in-flight read on the old handle
+        # cannot resurrect it. We deliberately do not hold self._lock here; the
+        # _closed flag is the cross-thread guard for the streaming path.
         streaming_changed = next_config.streaming != prev.streaming
         if streaming_changed or next_config.d455_profile != prev.d455_profile:
             old, self.d455 = self.d455, build_d455_stream(next_config)
@@ -416,6 +465,52 @@ def _safe_close(stream: CameraStream) -> None:
         stream.close()
     except Exception:
         pass
+
+
+def _depth_unavailable_snapshot(reason: str) -> D455Snapshot:
+    """A placeholder D455 snapshot for a force-degraded, spectrum-only capture.
+
+    The sample store still writes the d455/ payload (color.jpg, depth.png/.npy,
+    pointcloud PLYs, roi preview), so this must be a *valid* snapshot the writer
+    can serialise without crashing — not None. We therefore hand it 1x1 (black
+    color, zero depth) arrays and empty intrinsics. ``status`` is MISSING and the
+    detail records why depth was unavailable; ``imu`` is marked unavailable so
+    the IMU-motion quality check is skipped.
+    """
+    return D455Snapshot(
+        status=DeviceStatus.MISSING,
+        color_rgb=np.zeros((1, 1, 3), dtype=np.uint8),
+        depth_mm=np.zeros((1, 1), dtype=np.uint16),
+        profile={},
+        intrinsics={},
+        imu={"available": False},
+        captured_at=utc_now_iso(),
+        detail={"reason": "depth_unavailable", "error": reason},
+    )
+
+
+def _depth_unavailable_geometry() -> tuple[PointCloudResult, GeometryResult]:
+    """An empty point cloud + ``unavailable`` geometry for a degraded capture.
+
+    Carries the ``depth_unavailable`` warning that drives the sample to
+    QualityStatus.BAD in :meth:`CaptureCoordinator._quality`.
+    """
+    empty = np.empty((0, 3), dtype=np.float64)
+    pointcloud = PointCloudResult(
+        full_points_xyz_m=empty,
+        roi_points_xyz_m=empty,
+        roi_mask=np.zeros((1, 1), dtype=bool),
+    )
+    geometry = GeometryResult(
+        distance_mm=None,
+        depth_valid_ratio=0.0,
+        normal_camera=None,
+        angle_deg=None,
+        status="unavailable",
+        warnings=["depth_unavailable"],
+        detail={"reason": "d455 frame unavailable during capture"},
+    )
+    return pointcloud, geometry
 
 
 def build_d455_stream(config: AcquisitionConfig) -> CameraStream:

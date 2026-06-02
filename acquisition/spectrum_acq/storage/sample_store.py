@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
+import math
+import os
 import shutil
 import zipfile
 from pathlib import Path
@@ -12,12 +15,15 @@ from typing import Any
 import numpy as np
 from PIL import Image, ImageDraw
 
+from spectrum_acq import paths
 from spectrum_acq.devices.interfaces import D455Snapshot, H1Capture, MainRgbCapture
 from spectrum_acq.geometry.pointcloud import GeometryResult, PointCloudResult, roi_bounds
 from spectrum_acq.models import AcquisitionConfig, CaptureResult, QualityStatus, Roi, to_jsonable, utc_now
 
 from .ply import write_ascii_ply
 from .sqlite_index import SampleIndex, directory_size
+
+logger = logging.getLogger(__name__)
 
 
 class SampleStore:
@@ -53,6 +59,9 @@ class SampleStore:
             raise FileExistsError(f"sample already exists: {sample_id}")
         partial.mkdir(parents=True)
         try:
+            # Build the whole sample in the .partial directory. Any failure
+            # here (payload write) must NOT leave a sample under samples/, so
+            # this is the only section that can raise into a FAILED capture.
             self._write_payload(
                 partial,
                 h1=h1,
@@ -64,9 +73,13 @@ class SampleStore:
                 quality=quality,
                 metadata=metadata,
             )
-            partial.rename(final)
-            self.index.upsert_sample(final, metadata, quality)
+            # M7 (durability): fsync the payload directory tree before the
+            # rename so a power loss cannot leave a renamed-but-empty sample.
+            _fsync_tree(partial)
         except Exception as exc:
+            # The sample never reached samples/, so the on-disk state is clean.
+            # Quarantine the partial payload for offline diagnosis and re-raise
+            # so the capture is reported FAILED (and stays unindexed).
             if partial.exists():
                 _write_json(
                     partial / "error.json",
@@ -82,6 +95,27 @@ class SampleStore:
                 partial.rename(failed)
             raise
 
+        # H4 / M7: the rename is the atomic commit point. Once it succeeds the
+        # sample is a complete, durable directory under samples/. We then fsync
+        # the parent so the rename itself survives a power loss.
+        partial.rename(final)
+        _fsync_dir(self.samples_dir)
+
+        # H4: index the FINAL path AFTER the sample is durably on disk, and make
+        # the upsert best-effort. A failing index write must never turn a
+        # complete on-disk sample into a FAILED-but-present, unindexed sample;
+        # the filesystem is the source of truth and ``rebuild_index`` reconciles
+        # the SQLite cache. We log loudly so the gap is visible/operable.
+        try:
+            self.index.upsert_sample(final, metadata, quality)
+        except Exception:  # noqa: BLE001 - index is a rebuildable cache, not the truth
+            logger.exception(
+                "sample %s written to %s but index upsert failed; "
+                "sample is on disk and recoverable via rebuild_index()",
+                sample_id,
+                final,
+            )
+
         return CaptureResult(
             sample_id=sample_id,
             sample_path=str(final),
@@ -91,7 +125,31 @@ class SampleStore:
         )
 
     def storage_status(self) -> dict[str, Any]:
-        usage = shutil.disk_usage(self.root)
+        # L7: disk_usage can raise OSError (e.g. the data_dir is on a mount that
+        # went away). Don't let that surface as an opaque 500 that aborts a
+        # capture; report a "storage-unavailable" status instead. The free-space
+        # gate in the coordinator only blocks on ``free_bytes <= stop_free_bytes``
+        # AND ``status`` checks, so a BAD/unknown status fails safe (capture is
+        # marked low-quality / blocked rather than crashing).
+        try:
+            usage = shutil.disk_usage(self.root)
+        except OSError as exc:
+            logger.warning("storage_status: disk_usage(%s) failed: %s", self.root, exc)
+            # Fail safe: report zero free space so the numeric free-space gates in
+            # the coordinator / export helpers treat storage as full (block /
+            # warn) rather than raising on a None comparison. The ``available``
+            # flag and ``error`` string carry the real "unknown" signal.
+            return {
+                "data_dir": str(self.root),
+                "total_bytes": 0,
+                "used_bytes": 0,
+                "free_bytes": 0,
+                "warn_free_bytes": self.config.disk.warn_free_bytes,
+                "stop_free_bytes": self.config.disk.stop_free_bytes,
+                "status": QualityStatus.BAD,
+                "available": False,
+                "error": str(exc),
+            }
         free = usage.free
         if free <= self.config.disk.stop_free_bytes:
             status = QualityStatus.BAD
@@ -107,6 +165,7 @@ class SampleStore:
             "warn_free_bytes": self.config.disk.warn_free_bytes,
             "stop_free_bytes": self.config.disk.stop_free_bytes,
             "status": status,
+            "available": True,
         }
 
     def list_samples(self, *, limit: int = 100) -> list[dict[str, Any]]:
@@ -116,7 +175,12 @@ class SampleStore:
         return self.index.get_sample(sample_id)
 
     def sample_path(self, sample_id: str) -> Path:
-        return self.samples_dir / sample_id
+        # M17: never trust ``sample_id`` to be a bare component. Route it through
+        # paths.safe_join so a traversal payload (e.g. "../../etc") cannot escape
+        # samples_dir. safe_join raises ValueError on an invalid name or an
+        # escape; callers (API routes) already pre-validate and treat failures
+        # as 404, but this is the authoritative containment layer.
+        return paths.safe_join(self.samples_dir, sample_id)
 
     def export_sample_zip(self, sample_id: str) -> Path:
         sample_path = self.sample_path(sample_id)
@@ -236,9 +300,73 @@ class SampleStore:
 
 
 def _write_json(path: Path, payload: Any) -> None:
+    # M7 (durability): flush + fsync so the JSON metadata/quality artifacts hit
+    # stable storage. quality.json/metadata.json are the artifacts ``rebuild``
+    # relies on to reconstruct the index, so they must survive a power loss.
     with path.open("w", encoding="utf-8") as f:
         json.dump(to_jsonable(payload), f, ensure_ascii=False, indent=2)
         f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _fsync_dir(path: Path) -> None:
+    """fsync a directory so renames/creations of its entries are durable.
+
+    Directory fsync is how POSIX guarantees a rename (or the appearance of a
+    new file) survives a crash. Best-effort: some filesystems / platforms
+    disallow opening a directory for fsync, in which case we log and move on
+    rather than failing an otherwise-successful capture.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError as exc:  # pragma: no cover - platform/filesystem dependent
+        logger.debug("fsync_dir: open(%s) failed: %s", path, exc)
+        return
+    try:
+        os.fsync(fd)
+    except OSError as exc:  # pragma: no cover - platform/filesystem dependent
+        logger.debug("fsync_dir: fsync(%s) failed: %s", path, exc)
+    finally:
+        os.close(fd)
+
+
+def _fsync_tree(root: Path) -> None:
+    """fsync every file and directory under *root* (inclusive).
+
+    Used to make a freshly-written sample payload durable before the atomic
+    rename into samples/. We fsync files first, then their containing
+    directories, finishing with *root* itself.
+    """
+    for child in sorted(root.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+        if child.is_file():
+            try:
+                fd = os.open(child, os.O_RDONLY)
+            except OSError as exc:  # pragma: no cover - filesystem dependent
+                logger.debug("fsync_tree: open(%s) failed: %s", child, exc)
+                continue
+            try:
+                os.fsync(fd)
+            except OSError as exc:  # pragma: no cover - filesystem dependent
+                logger.debug("fsync_tree: fsync(%s) failed: %s", child, exc)
+            finally:
+                os.close(fd)
+        elif child.is_dir():
+            _fsync_dir(child)
+    _fsync_dir(root)
+
+
+def _csv_cell(value: Any) -> Any:
+    """L2: render a CSV cell, blanking non-finite floats.
+
+    JSON serialisation nullifies NaN/inf (via ``to_jsonable``), but the CSV
+    writer would otherwise emit literal ``nan``/``inf`` tokens. Mirror the JSON
+    behaviour by writing an empty cell for any non-finite float so the two
+    representations agree and downstream parsers don't choke.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return ""
+    return value
 
 
 def _write_spectrum_csv(
@@ -247,7 +375,9 @@ def _write_spectrum_csv(
     with path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["wavelength_nm", "raw", "actual"])
-        writer.writerows(zip(wavelengths, raw, actual))
+        writer.writerows(
+            (_csv_cell(w), _csv_cell(r), _csv_cell(a)) for w, r, a in zip(wavelengths, raw, actual)
+        )
 
 
 def _write_exposure_frames(h1_dir: Path, h1: H1Capture) -> None:

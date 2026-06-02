@@ -44,6 +44,7 @@ import {
   decodeExposureTimeUs,
   decodeSpectrumFrame,
   decodeWavelengthRange,
+  FRAME_OVERHEAD,
   HEADER_RESP_0,
   HEADER_RESP_1,
   parseResponse,
@@ -81,6 +82,13 @@ interface PendingRequest {
 const DEFAULT_TIMEOUT_MS = 1000;
 /** Maximum cmdData per efficiency-curve packet (247 floats = 988 bytes). */
 const EFFICIENCY_CHUNK_FLOATS = 247;
+/**
+ * Sanity cap on a frame's totalLen (1 MiB). The largest real frame is a TM30
+ * spectrum (~4 KiB), so anything above this is a bogus header detected inside
+ * payload data. Mirrors the Python SDK's 1_000_000 cap (the C++ SDK uses
+ * 64 KiB); a totalLen outside [FRAME_OVERHEAD, MAX_FRAME_LEN] triggers resync.
+ */
+const MAX_FRAME_LEN = 1024 * 1024;
 
 export class Device extends EventEmitter {
   private readonly port: SerialPortLike;
@@ -491,7 +499,25 @@ export class Device extends EventEmitter {
         }
         continue;
       }
-      if (totalLen === undefined || this.rxBuffer.length < totalLen) return;
+      if (totalLen === undefined) return;
+      // Bound totalLen before trusting it. A false CC 81 sequence inside
+      // payload data would otherwise yield a huge length, causing us to wait
+      // forever for bytes that never come while rxBuffer grows unbounded (up
+      // to a 16.7 MB uint24). If the length is implausible the header is bogus:
+      // drop one byte and resync, mirroring Python (1 MB cap) / C++ (64 KiB).
+      if (totalLen < FRAME_OVERHEAD || totalLen > MAX_FRAME_LEN) {
+        this.rxBuffer = this.rxBuffer.subarray(1);
+        const err = new ProtocolError(
+          `implausible totalLen=${totalLen}; resynchronising`,
+        );
+        if (this.inflight) {
+          this.inflight.reject(err);
+        } else {
+          this.emit('error', err);
+        }
+        continue;
+      }
+      if (this.rxBuffer.length < totalLen) return;
       const frame = this.rxBuffer.subarray(0, totalLen);
       this.rxBuffer = this.rxBuffer.subarray(totalLen);
       this.handleFrame(Buffer.from(frame));
