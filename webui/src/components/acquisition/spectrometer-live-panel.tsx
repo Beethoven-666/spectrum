@@ -8,6 +8,7 @@ import { ExposureStatusBadge } from '@/components/status-badge';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Switch } from '@/components/ui/switch';
 import { acquisitionPath } from '@/lib/acquisition-client';
 import { numFixed, numInt } from '@/lib/format';
 import { useSpectrumStream } from '@/lib/sse';
@@ -30,13 +31,17 @@ export function SpectrometerLivePanel({
   disabled = false,
 }: SpectrometerLivePanelProps): React.ReactElement {
   const [running, setRunning] = useState(true);
+  const [tm30, setTm30] = useState(false);
   const [failedUrl, setFailedUrl] = useState<string | null>(null);
 
   // streamAllowed already gates on !disabled, so the H1 stream pauses during a
   // capture and resumes afterwards without needing an effect to flip `running`.
   const streamAllowed = serviceOk && h1Ready && !disabled;
   const mainRgbReady = mainRgbStatus === 'ready';
-  const { frame, stats } = useSpectrumStream({ enabled: running && streamAllowed, tm30: false });
+  // Toggling tm30 re-subscribes the stream (useSpectrumStream deps), which
+  // restarts it with 0x35 instead of 0x33 — the stop/restart PROTOCOL.md §8.3
+  // requires to switch TM-30.
+  const { frame, stats } = useSpectrumStream({ enabled: running && streamAllowed, tm30 });
 
   const mainRgbUrl = useMemo(
     () => `${acquisitionPath('/preview/main_rgb/frame')}?v=${previewVersion}`,
@@ -55,24 +60,30 @@ export function SpectrometerLivePanel({
             分光镜对齐视场：主 RGB 预览与 H1 实时光谱同屏对照；采集时会自动停止光谱流。
           </CardDescription>
         </div>
-        <Button
-          variant={running ? 'destructive' : 'default'}
-          size="sm"
-          onClick={() => setRunning((current) => !current)}
-          disabled={!streamAllowed}
-        >
-          {running ? (
-            <>
-              <Pause className="h-4 w-4" />
-              停止光谱流
-            </>
-          ) : (
-            <>
-              <Play className="h-4 w-4" />
-              开始光谱流
-            </>
-          )}
-        </Button>
+        <div className="flex items-center gap-4">
+          <label className="flex items-center gap-2 text-sm">
+            <Switch checked={tm30} onCheckedChange={setTm30} disabled={!streamAllowed} />
+            <span>含 TM-30</span>
+          </label>
+          <Button
+            variant={running ? 'destructive' : 'default'}
+            size="sm"
+            onClick={() => setRunning((current) => !current)}
+            disabled={!streamAllowed}
+          >
+            {running ? (
+              <>
+                <Pause className="h-4 w-4" />
+                停止光谱流
+              </>
+            ) : (
+              <>
+                <Play className="h-4 w-4" />
+                开始光谱流
+              </>
+            )}
+          </Button>
+        </div>
       </CardHeader>
       <CardContent className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.35fr)]">
         <MainRgbPreview

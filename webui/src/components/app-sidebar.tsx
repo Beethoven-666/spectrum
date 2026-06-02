@@ -3,7 +3,6 @@
 import {
   Activity,
   Aperture,
-  ChartLine,
   DatabaseZap,
   FileTerminal,
   Settings,
@@ -33,7 +32,6 @@ const ITEMS: ReadonlyArray<{
   group: string;
 }> = [
   { href: '/acquisition', label: '多模态采集', icon: DatabaseZap, group: '采集' },
-  { href: '/stream', label: 'H1 实时流', icon: ChartLine, group: '采集' },
   { href: '/debug', label: '本机仪表盘', icon: Activity, group: '本机 H1 调试' },
   { href: '/capture', label: '本机单帧采集', icon: Aperture, group: '本机 H1 调试' },
   { href: '/settings', label: '本机设备设置', icon: Settings, group: '本机 H1 调试' },
