@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import numpy as np
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -89,7 +90,12 @@ class StreamingConfig:
     backoff_max_s: float = 30.0
     max_frame_age_s: float = 2.0
     d455_get_fresh_timeout_s: float = 8.0
-    main_rgb_get_fresh_timeout_s: float = 12.0
+    # How long a capture waits for a fresh main RGB frame before degrading to
+    # ``main_rgb_missing`` (the camera is optional). A healthy warm camera
+    # delivers a new frame in ~one preview period (preview_fps=4 -> ~0.25 s), so a
+    # short budget is plenty AND it keeps a wedged/absent camera from adding its
+    # full timeout to every capture.
+    main_rgb_get_fresh_timeout_s: float = 1.0
     reopen_attempts_before_hw_reset: int = 5
 
 
@@ -110,13 +116,14 @@ class H1AutoExposureConfig:
     under_multiplier: float = 1.7
     over_multiplier: float = 0.55
     min_exposure_us: int = 500
-    max_exposure_us: int = 5_000_000
+    max_exposure_us: int = 1_000_000
     initial_exposure_us: int = 50_000
     # Number of exposure levels captured (and saved) in ``multi_exposure`` mode.
     multi_exposure_steps: int = 5
     # Exposure cap for the LIVE stream only (uses the device's native auto-exposure
-    # per frame). Kept well below ``max_exposure_us`` so the preview stays
-    # responsive — a 5 s sample exposure would mean ~12 s per preview frame.
+    # per frame). Capped at ``max_exposure_us`` (the stream uses
+    # ``min(max_exposure_us, stream_max_exposure_us)``) so a long sample exposure
+    # never makes the preview crawl.
     stream_max_exposure_us: int = 1_000_000
 
 
@@ -195,6 +202,16 @@ def to_jsonable(value: Any) -> Any:
         return [to_jsonable(v) for v in value]
     if isinstance(value, float):
         return value if math.isfinite(value) else None
+    # numpy is pervasive here (frames, intrinsics, IMU, spectra). json.dump cannot
+    # serialize ndarrays or numpy scalars (np.float32/np.int64/np.bool_…), so a
+    # single stray numpy value used to blow up the whole capture write with
+    # "Object of type ndarray is not JSON serializable". Convert arrays to nested
+    # lists and numpy scalars to plain Python, recursing so NaN/Inf floats inside
+    # are still nulled by the float branch above.
+    if isinstance(value, np.ndarray):
+        return to_jsonable(value.tolist())
+    if isinstance(value, np.generic):
+        return to_jsonable(value.item())
     return value
 
 

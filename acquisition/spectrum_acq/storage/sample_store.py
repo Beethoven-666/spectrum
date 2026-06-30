@@ -284,7 +284,19 @@ class SampleStore:
         write_ascii_ply(root / "d455" / "pointcloud_full.ply", pointcloud.full_points_xyz_m)
         write_ascii_ply(root / "d455" / "pointcloud_roi.ply", pointcloud.roi_points_xyz_m)
 
-        _write_json(root / "main_rgb" / "status.json", to_jsonable(main_rgb))
+        # status.json carries status + metadata only — NOT the raw frame. The
+        # image is written separately as color.jpg below; embedding the ndarray
+        # here would bloat the JSON with a 640x480x3 nested list (and used to crash
+        # the whole capture before to_jsonable handled numpy).
+        _write_json(
+            root / "main_rgb" / "status.json",
+            {
+                "status": to_jsonable(main_rgb.status),
+                "captured_at": main_rgb.captured_at,
+                "metadata": to_jsonable(main_rgb.metadata),
+                "has_image": main_rgb.image_rgb is not None,
+            },
+        )
         if main_rgb.image_rgb is not None:
             _save_rgb(root / "main_rgb" / "color.jpg", main_rgb.image_rgb)
 

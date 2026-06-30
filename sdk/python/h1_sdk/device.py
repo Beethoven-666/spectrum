@@ -335,6 +335,7 @@ class Device:
         self._streaming = True
         sent_stop = False
         emitted = 0
+        last_exposure_us: Optional[int] = None
         try:
             self._write_frame(_p.cmd_start_stream(include_tm30))
             while True:
@@ -349,6 +350,7 @@ class Device:
                     raise
                 _, valid = _p.parse_frame(raw, expected_cmd_type=stream_cmd)
                 frame = _p.decode_spectrum_frame(valid, include_tm30=include_tm30)
+                last_exposure_us = frame.exposure_time_us
                 emitted += 1
                 yield frame
         finally:
@@ -357,11 +359,21 @@ class Device:
                     self._write_frame(_p.cmd_stop_capture())
                     sent_stop = True
                     # Drain in-flight frames the device emits after 0x04
-                    # (PROTOCOL.md §8.2). Wait the full window — a trailing frame
-                    # at a long exposure only starts arriving ~one exposure period
-                    # after the stop, so we must not bail the instant the buffer is
-                    # momentarily empty.
-                    drain_deadline = time.monotonic() + max(stop_drain_s, 0.0)
+                    # (PROTOCOL.md §8.2). A trailing frame only starts arriving
+                    # ~one *current* exposure period after the stop, so the window
+                    # needs to cover one exposure — but the caller sizes
+                    # ``stop_drain_s`` to the worst-case exposure *cap* (which can be
+                    # seconds) because it can't know the auto-converged exposure up
+                    # front. We DO know it here (the last frame's exposure), so drain
+                    # for that instead, clamped to never exceed the caller's window.
+                    # This keeps a long-exposure stream safe while making the common
+                    # short-exposure case hand the device back in well under a second.
+                    drain_window = max(stop_drain_s, 0.0)
+                    if last_exposure_us is not None:
+                        drain_window = min(
+                            drain_window, (last_exposure_us / 1_000_000.0) + 0.4
+                        )
+                    drain_deadline = time.monotonic() + drain_window
                     while time.monotonic() < drain_deadline:
                         try:
                             in_waiting = getattr(self._port, "in_waiting", 0) or 0

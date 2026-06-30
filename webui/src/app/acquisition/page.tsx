@@ -50,6 +50,13 @@ import {
 import { ApiCallError, apiSend, fetcher } from '@/lib/api-client';
 
 const REFRESH_MS = 5000;
+// Camera previews (D455 RGB/Depth, main RGB) refresh independently of the 5 s
+// status polling, at the backend's preview cap (CameraWorker preview_fps = 6 for
+// the D455). preview() returns the worker's latest *cached* frame, so polling at
+// the production rate keeps the preview near-live without extra USB grabs; polling
+// faster would only re-encode the same JPEG.
+const PREVIEW_FPS = 6;
+const PREVIEW_MS = Math.round(1000 / PREVIEW_FPS);
 
 type ConfigDraft = {
   colorWidth: string;
@@ -143,7 +150,9 @@ export default function AcquisitionPage(): React.ReactElement {
   const { data: d455Imu } = useSWR<D455ImuPayload>(
     health?.ok ? acquisitionPath('/preview/d455/imu') : null,
     fetcher,
-    { refreshInterval: previewsActive ? REFRESH_MS : 0 },
+    // Keep the attitude indicator in step with the live preview (reads the same
+    // cached snapshot, so it's cheap) instead of lagging at the 5 s status rate.
+    { refreshInterval: previewsActive ? PREVIEW_MS : 0 },
   );
 
   useEffect(() => {
@@ -157,7 +166,7 @@ export default function AcquisitionPage(): React.ReactElement {
     if (!previewsActive) return;
     const timer = setInterval(() => {
       setPreviewVersion((current) => current + 1);
-    }, REFRESH_MS);
+    }, PREVIEW_MS);
     return () => clearInterval(timer);
   }, [previewsActive]);
 
@@ -845,7 +854,7 @@ function draftToConfig(draft: ConfigDraft): Partial<AcquisitionConfig> {
       max_attempts: intValue(draft.maxAttempts, 4),
       initial_exposure_us: intValue(draft.initialExposureUs, 50000),
       min_exposure_us: intValue(draft.minExposureUs, 500),
-      max_exposure_us: intValue(draft.maxExposureUs, 5000000),
+      max_exposure_us: intValue(draft.maxExposureUs, 1000000),
       under_multiplier: numberValue(draft.underMultiplier, 1.7),
       over_multiplier: numberValue(draft.overMultiplier, 0.55),
       multi_exposure_steps: intValue(draft.multiExposureSteps, 5),

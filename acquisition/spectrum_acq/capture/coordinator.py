@@ -40,6 +40,23 @@ from spectrum_acq.models import (
 from spectrum_acq.storage import SampleStore
 
 
+# How long a device-acquiring call (a sample capture or an H1 control op) waits to
+# take the single device lock from a running live stream. The live H1 stream holds
+# the lock for its whole lifetime and only yields the device when it tears the SDK
+# generator down: it stops yielding (observed between frames), sends CMD 0x04 and
+# drains trailing frames (up to roughly one exposure-cap period, PROTOCOL.md §8.2)
+# before releasing the lock. That teardown routinely takes several seconds, so a
+# short acquire timeout surfaces a spurious "capture busy" even though the stream
+# is in the act of yielding the device. We preempt the stream (see ``_preempt``)
+# and wait comfortably longer than the worst-case teardown window.
+_DEVICE_ACQUIRE_TIMEOUT_S = 15.0
+
+# A newly opened live stream waits this long for an in-flight capture/control op to
+# finish before reporting busy. A sample capture runs auto-exposure convergence
+# (seconds), so the stream needs room before it gives up.
+_STREAM_ACQUIRE_TIMEOUT_S = 12.0
+
+
 class CaptureCoordinator:
     def __init__(
         self,
@@ -56,6 +73,10 @@ class CaptureCoordinator:
         self.main_rgb = main_rgb
         self.store = store or SampleStore(config)
         self._lock = threading.Lock()
+        # Set by a capture/control op that wants the device while a live stream
+        # holds the lock. The stream loop checks it between frames and breaks so
+        # the lock is handed over promptly instead of the caller timing out.
+        self._preempt = threading.Event()
         self._state = CaptureState.IDLE
         self._current: dict[str, Any] = {"state": self._state, "sample_id": None, "error": None}
         self._last_h1_status: dict[str, Any] | None = None
@@ -73,30 +94,58 @@ class CaptureCoordinator:
                 self._lock.release()
         else:
             # The H1 is single-owner: while a capture/stream holds the lock we
-            # cannot read a live status. Returning the last cached snapshot as-is
-            # would mislead the UI (stale READY) and fabricating ERROR would raise
-            # a false alarm. Instead present an explicit, non-READY "busy" status
-            # with a stale marker, carrying the last-known identity fields so the
-            # UI keeps the serial/wavelength without claiming the device is live.
+            # cannot read a live status. The lock is almost always held because
+            # OUR OWN live spectrum stream (or a capture) is using the device — in
+            # which case the device demonstrably opened and is working, so we must
+            # NOT report it as not-ready. Previously this returned status="busy",
+            # which the UI renders as "H1 未就绪" (red) and, worse, uses to gate the
+            # live stream off — so an actively-streaming H1 flapped between ready
+            # and "未就绪" every status poll. When the last live read was READY we
+            # therefore report that cached status, flagged ``stale``/``in_use`` so
+            # the UI keeps showing the device online without claiming a fresh read.
+            # Only when we never got a good read (or it was an error) do we fall
+            # back to an explicit "busy" so a genuine failure isn't masked.
             last = self._last_h1_status or {}
-            h1_status = {
-                "status": "busy",
-                "stale": True,
-                "serial_number": last.get("serial_number"),
-                "wavelength_range": last.get("wavelength_range"),
-                "exposure_time_us": last.get("exposure_time_us"),
-                "exposure_mode": last.get("exposure_mode"),
-                "max_exposure_time_us": last.get("max_exposure_time_us"),
-                "detail": {
-                    "reason": "busy",
-                    "error": "H1 capture or stream is busy; status is stale",
-                },
-            }
+            if last.get("status") == "ready":
+                h1_status = {**last, "stale": True, "in_use": True}
+            else:
+                h1_status = {
+                    "status": "busy",
+                    "stale": True,
+                    "serial_number": last.get("serial_number"),
+                    "wavelength_range": last.get("wavelength_range"),
+                    "exposure_time_us": last.get("exposure_time_us"),
+                    "exposure_mode": last.get("exposure_mode"),
+                    "max_exposure_time_us": last.get("max_exposure_time_us"),
+                    "detail": {
+                        "reason": "busy",
+                        "error": "H1 capture or stream is busy; status is stale",
+                    },
+                }
         return {
             "h1": h1_status,
             "d455": to_jsonable(self.d455.status()),
             "main_rgb": to_jsonable(self.main_rgb.status()),
         }
+
+    def _acquire_device(self, timeout: float, *, preempt: bool) -> bool:
+        """Take the single device lock, optionally preempting a running stream.
+
+        The live H1 stream holds the lock for its whole lifetime and only checks
+        for a preemption request between frames. A capture or control op therefore
+        SETS ``_preempt`` before blocking on the lock, so the stream breaks out of
+        its loop, tears the SDK generator down (CMD 0x04 + drain + RLock release on
+        its own thread) and releases the lock — instead of the caller passively
+        timing out with "capture busy". Whoever wins the lock clears the flag so its
+        own work (including a freshly started stream) is not self-preempted; that
+        clear also self-heals a flag left set by an acquire that timed out.
+        """
+        if preempt:
+            self._preempt.set()
+        acquired = self._lock.acquire(timeout=timeout)
+        if acquired:
+            self._preempt.clear()
+        return acquired
 
     def stream_h1(
         self,
@@ -104,19 +153,34 @@ class CaptureCoordinator:
         include_tm30: bool = False,
         max_frames: int | None = None,
     ) -> Iterator[dict[str, Any]]:
-        if not self._lock.acquire(timeout=5.0):
+        if not self._acquire_device(_STREAM_ACQUIRE_TIMEOUT_S, preempt=False):
             raise RuntimeError("capture busy")
+        # Hold an explicit reference so we can close the inner generator ON THIS
+        # THREAD in the finally — that runs the SDK stop/drain and releases the
+        # device RLock on the acquiring thread (closing it off-thread would hit the
+        # RLock cross-thread release bug). A plain ``for`` (vs ``yield from``) lets
+        # us interleave the preempt check between frames.
+        inner = self.h1.stream(
+            include_tm30=include_tm30,
+            max_frames=max_frames,
+            config=self.config.h1_auto_exposure,
+        )
         try:
-            yield from self.h1.stream(
-                include_tm30=include_tm30,
-                max_frames=max_frames,
-                config=self.config.h1_auto_exposure,
-            )
+            for frame in inner:
+                yield frame
+                # A capture or control op is waiting for the device — yield it now.
+                if self._preempt.is_set():
+                    break
         finally:
-            self._lock.release()
+            # Release the lock even if the SDK teardown raises — a wedged lock is
+            # exactly the failure we are fixing.
+            try:
+                inner.close()
+            finally:
+                self._lock.release()
 
-    def _run_h1_locked(self, fn, *, timeout: float = 5.0):
-        if not self._lock.acquire(timeout=timeout):
+    def _run_h1_locked(self, fn, *, timeout: float = _DEVICE_ACQUIRE_TIMEOUT_S):
+        if not self._acquire_device(timeout, preempt=True):
             raise RuntimeError("capture busy")
         try:
             return fn()
@@ -174,7 +238,7 @@ class CaptureCoordinator:
         exposure_mode: str | None = None,
         force: bool = False,
     ) -> CaptureResult:
-        if not self._lock.acquire(timeout=5.0):
+        if not self._acquire_device(_DEVICE_ACQUIRE_TIMEOUT_S, preempt=True):
             raise RuntimeError("capture busy")
         sample_id = make_sample_id()
         started_wall = utc_now_iso()
