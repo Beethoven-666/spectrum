@@ -20,8 +20,9 @@ def run_test():
 
     # 初始化配置
     # 单次抓图模式更容易排查物理连接问题
-    profile = MainRgbProfile(device_path=device_path, mode="single_shot", width=640, height=480)
-    
+    #profile = MainRgbProfile(device_path=device_path, mode="single_shot", width=640, height=480)
+    profile = MainRgbProfile(device_path=device_path, mode="persistent", width=640, height=480)
+
     print("\n=== 2. 初始化 V4l2MainRgbCamera 驱动 ===")
     camera = V4l2MainRgbCamera(profile)
     
